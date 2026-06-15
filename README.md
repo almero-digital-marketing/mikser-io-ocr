@@ -1,0 +1,339 @@
+# mikser-io-ocr
+
+Schema-driven OCR + structured-data extraction for [mikser-io](https://github.com/almero-digital-marketing/mikser-io). Drop a folder of PDFs / scanned images / plain-text docs into the catalog (via [documents](https://github.com/almero-digital-marketing/mikser-io), [mikser-io-provider-gdrive](https://github.com/almero-digital-marketing/mikser-io-provider-gdrive), or any other source); declare a [zod](https://zod.dev) schema describing what you want out of them; this plugin walks the catalog at `onProcess`, fires a multi-modal model call, and populates `entity.meta` with the validated structured data.
+
+The "OCR" in the name is the operator-mental-model verb. The plugin actually does OCR-and-structure as one call via modern multi-modal models (OpenAI `gpt-4o-mini`, Anthropic Claude Sonnet, Google Gemini, etc., dispatched through the [Vercel AI SDK](https://sdk.vercel.ai)). Pure-text input works too — same dispatch, same schema-constrained output, no image step.
+
+```
+documents / files / drive entities arrive in the catalog
+   │
+   ▼
+onProcess → for each new/updated entity:
+   │
+   ▼
+match? — first glob in options.match against entity.id wins
+   │
+   ▼
+resolveSchema(spec) — name string OR direct zod object
+   │
+   ▼
+schema.safeParse(entity.meta) already passes? → skip (no LLM call)
+   │
+   ▼
+readEntityContent(entity) — provider dispatch (fs / gdrive / ...)
+   ├─ text  → { content }
+   └─ binary → { contentSkipped, cachedAt: <path> } — provider mirrored the file
+   │
+   ▼
+generateObject({ model, schema, messages }) — provider-agnostic via AI SDK
+   │
+   ▼
+entity.meta = { ...entity.meta, ...result } — auto-persisted by the journal
+```
+
+## Install
+
+```bash
+npm install mikser-io-ocr ai @ai-sdk/openai zod
+```
+
+Peer dependencies — pick the provider package matching your model choice:
+
+| Provider | Package |
+|---|---|
+| OpenAI | `@ai-sdk/openai` |
+| Anthropic | `@ai-sdk/anthropic` |
+| Google Gemini | `@ai-sdk/google` |
+| Ollama / OpenAI-compatible | `@ai-sdk/openai-compatible` |
+| Any other AI-SDK provider | the corresponding `@ai-sdk/<provider>` package |
+
+The plugin doesn't care which one — it just calls `generateObject({ model: <whatever-you-passed> })`.
+
+## Setting up a model provider (one-time)
+
+### OpenAI (most common)
+
+1. Sign up at https://platform.openai.com and add a payment method.
+2. **API keys** → **Create new secret key**. Copy it — you only see it once.
+3. Export the key:
+   ```bash
+   export OPENAI_API_KEY=sk-...
+   ```
+4. Pick a model. `gpt-4o-mini` is the right default for v1 — multi-modal (handles PDFs and images), schema-constrained output, ~10× cheaper than `gpt-4o`. Use `gpt-4o` if accuracy on hard scans matters more than cost.
+
+### Anthropic
+
+1. Sign up at https://console.anthropic.com, add a payment method.
+2. **API Keys** → **Create Key**.
+3. Export:
+   ```bash
+   export ANTHROPIC_API_KEY=sk-ant-...
+   ```
+4. Multi-modal models: `claude-3-5-sonnet-latest` (slower, higher quality), `claude-3-5-haiku-latest` (faster, cheaper).
+
+### Local / offline (Ollama)
+
+1. Install Ollama at https://ollama.com, pull a multi-modal model:
+   ```bash
+   ollama pull llama3.2-vision
+   ```
+2. No API key needed; Ollama serves on `localhost:11434`.
+
+Vision capabilities on local models are weaker than the cloud providers; for production OCR-from-scan workflows, the hosted models are the realistic choice. Local makes sense for "extract from already-OCR'd text" or for dev iteration without burning quota.
+
+## Configure
+
+The plugin accepts schemas two ways. Pick whichever fits the rest of your project:
+
+### Option 1 — schema by name (via mikser-io-schemas)
+
+Drop your schemas into `schemas/<name>.js` and let [mikser-io-schemas](https://github.com/almero-digital-marketing/mikser-io-schemas) own the registry:
+
+```js
+// schemas/invoice.js
+import { z } from 'zod'
+export default z.object({
+    vendor: z.string(),
+    amount: z.number(),
+    date:   z.string().datetime(),
+    lineItems: z.array(z.object({
+        description: z.string(),
+        quantity:    z.number(),
+        unitPrice:   z.number(),
+    })).default([]),
+})
+```
+
+```js
+// mikser.config.js
+import { documents, frontMatter } from 'mikser-io'
+import { layouts } from 'mikser-io-layouts'
+import { schemas } from 'mikser-io-schemas'
+import { ocr }     from 'mikser-io-ocr'
+import { openai }  from '@ai-sdk/openai'
+
+export default {
+    plugins: [
+        documents(),
+        frontMatter(),
+        layouts(),
+        schemas({                                  // MUST come before ocr()
+            schemaKey: 'meta.layout',
+        }),
+        ocr({
+            model: openai('gpt-4o-mini'),
+            match: {
+                '/documents/invoices/**/*.pdf': 'invoice',     // ← by NAME
+                '/documents/receipts/**/*.png': 'receipt',
+            },
+        }),
+    ],
+}
+```
+
+Pros: schemas live in one canonical place; adding a new entity type means dropping `schemas/<name>.js` and using the name in `ocr({match: ...})`, [mikser-io-schemas](https://github.com/almero-digital-marketing/mikser-io-schemas) (validation + .d.ts gen), and any future consumer.
+
+### Option 2 — schema by direct import
+
+Skip the schemas plugin and import the zod object straight into the config:
+
+```js
+import { documents } from 'mikser-io'
+import { ocr }       from 'mikser-io-ocr'
+import { openai }    from '@ai-sdk/openai'
+import { z }         from 'zod'
+
+const invoiceSchema = z.object({
+    vendor: z.string(),
+    amount: z.number(),
+    date:   z.string().datetime(),
+})
+
+export default {
+    plugins: [
+        documents(),
+        ocr({
+            model: openai('gpt-4o-mini'),
+            match: {
+                '/documents/invoices/**/*.pdf': invoiceSchema,   // ← by IMPORT
+            },
+        }),
+    ],
+}
+```
+
+Pros: no schemas folder; useful when the schema is computed or composed at config time (`z.discriminatedUnion([...])`, `baseSchema.extend({...})`).
+
+Both modes work simultaneously in one `match` map — strings get resolved by name, objects pass through directly.
+
+## How it decides whether to call the LLM
+
+Three conditions; all must be true to fire:
+
+1. **Glob match.** `entity.id` matches a pattern in `options.match`. First match wins (deterministic insertion-order).
+2. **`safeParse` fails.** `schema.safeParse(entity.meta)` returns `success: false`. Already-validated entities don't burn tokens on re-runs.
+3. **Content available.** `readEntityContent(entity)` returns either `{ content: <text> }` or `{ cachedAt: <local path> }`. Failures (network, permissions) skip with a warning.
+
+This means warm builds — second `mikser` run on the same Drive folder, no changes — call the LLM **zero times**. Only entities whose meta is incomplete relative to the schema get processed.
+
+## Multi-modal input
+
+The plugin auto-detects the source modality from what the provider's `read()` returned:
+
+| `readEntityContent` result | Message shape sent to `generateObject` |
+|---|---|
+| `{ content: <utf8 text> }` | `[{ role: 'user', content: [{type:'text'}, {type:'text', text: source}] }]` |
+| `{ cachedAt: <PDF path> }` | `[{ role: 'user', content: [{type:'text'}, {type:'file', data: <bytes>, mimeType: 'application/pdf'}] }]` |
+| `{ cachedAt: <image path> }` (`.png`/`.jpg`/`.jpeg`/`.gif`/`.webp`) | `[{ role: 'user', content: [{type:'text'}, {type:'image', image: <bytes>, mimeType}] }]` |
+
+AI SDK normalizes these into provider-specific shapes (OpenAI `input_file` / `input_image`, Anthropic attachments, etc.).
+
+## Options reference
+
+```js
+ocr({
+    // REQUIRED. AI SDK model factory result.
+    //   openai('gpt-4o-mini')        — OpenAI
+    //   anthropic('claude-3-5-sonnet-latest') — Anthropic
+    //   google('gemini-1.5-flash')   — Google
+    //   custom providers — anything matching AI SDK's LanguageModelV2 interface
+    model: openai('gpt-4o-mini'),
+
+    // REQUIRED. Glob → schema map. Schema can be a string (name, looked up
+    // via runtime.options.schemas.lookup) or a zod object (direct).
+    match: {
+        '/documents/invoices/**/*.pdf': 'invoice',
+        '/documents/contracts/**/*':    contractSchema,
+    },
+
+    // OPTIONAL. Override the default extraction prompt. Default is
+    // "Extract structured data from this source matching the provided
+    //  schema. Use null for any field that is genuinely not present
+    //  rather than inferring from context."
+    prompt: 'Extract invoice data. Treat empty cells as null, not 0.',
+
+    // OPTIONAL. Anything passed here is spread into the generateObject
+    // call as-is. Use for: temperature, top_p, providerOptions, etc.
+    generateObjectOptions: {
+        temperature: 0,                          // deterministic
+        providerOptions: {
+            openai: { reasoningEffort: 'low' },
+        },
+    },
+})
+```
+
+## End-to-end demo: PDF → CSV invoice round-trip
+
+The format-liberation pitch in mikser's 9.0 plan: PDFs into the catalog, structured data extracted, rendered to a CSV the accountant can pull from a synced folder.
+
+```js
+// mikser.config.js
+import { documents, frontMatter } from 'mikser-io'
+import { providerGdrive } from 'mikser-io-provider-gdrive'
+import { schemas }        from 'mikser-io-schemas'
+import { ocr }            from 'mikser-io-ocr'
+import { openai }         from '@ai-sdk/openai'
+
+export default {
+    plugins: [
+        documents(),
+        frontMatter(),
+
+        // 1. Sync PDFs from a shared Drive folder
+        providerGdrive({
+            auth: { keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS },
+            folders: [{
+                folderId:   process.env.DRIVE_INVOICES_FOLDER,
+                collection: 'documents',
+                prefix:     '/drive/invoices/',
+            }],
+        }),
+
+        // 2. Schemas folder owns the invoice shape
+        schemas({ schemaKey: 'meta.layout' }),
+
+        // 3. OCR extracts structured data per-entity
+        ocr({
+            model: openai('gpt-4o-mini'),
+            match: {
+                '/drive/invoices/**/*.pdf': 'invoice',
+            },
+        }),
+
+        // 4. (later — mikser-io-render-csv when it ships) — aggregate
+        //    entity.meta into a CSV file
+    ],
+}
+```
+
+Run:
+
+```bash
+export OPENAI_API_KEY=sk-...
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+export DRIVE_INVOICES_FOLDER=0Bz...
+mikser --watch
+```
+
+What happens:
+- Drive folder gets walked. 47 PDFs become entities with `uri = gdrive://<fileId>/q1-acme.pdf`.
+- OCR's `onProcess` sees the new entities. Each PDF matches `'/drive/invoices/**/*.pdf'` → resolves `'invoice'` → `safeParse({}) fails` → `readEntityContent` (gdrive provider mirrors the binary to `runtime/gdrive-cache/<fileId>.pdf`) → `generateObject` with the PDF as a file block → meta populated.
+- On the next watch tick: no changes → `safeParse` passes → zero LLM calls.
+- Edit a PDF in Drive: change propagates via `drive.changes.list` → entity reappears in journal → `safeParse` fails (or just runs again) → LLM call → updated meta.
+
+The catalog now holds 47 typed invoice entities. Query them via `mikser_query_entities` MCP tool, render them through a `render-csv` layout for the accountant, vectorize them via `mikser-io-vector` for "find invoices similar to this one" — every downstream plugin sees them as ordinary entities with valid meta.
+
+## Troubleshooting
+
+### `ocr: schema "invoice" not registered`
+
+The plugin tried a name lookup but `schemas()` either isn't in `plugins[]` or it didn't load a file at `schemas/invoice.js`. Two fixes:
+
+- Add `schemas({...})` to `plugins[]` **before** `ocr({...})` (factory call order matters because schemas plugin exposes the lookup surface at factory-eval time).
+- Or pass the schema directly via import instead of by name.
+
+### `ocr: no model configured`
+
+`ocr({model: ...})` is required. Pass the result of an AI SDK provider call (`openai('gpt-4o-mini')`, etc.).
+
+### `generateObject failed: Cannot find module '@ai-sdk/openai'`
+
+You imported from `@ai-sdk/openai` in your config but didn't install the package. `npm install @ai-sdk/openai`.
+
+### `generateObject failed: 401 Incorrect API key provided`
+
+Provider authentication. Verify `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` is exported in the same shell that runs `mikser`.
+
+### `generateObject failed: 429 Too Many Requests`
+
+Provider rate-limited. Options:
+- Drop to a smaller model (`gpt-4o` → `gpt-4o-mini`, `claude-3-5-sonnet` → `claude-3-5-haiku`) to reduce per-call cost and increase TPM headroom.
+- Add `temperature: 0` and a tight prompt to reduce retry rate.
+- Add an explicit pause between cycles via mikser's watch interval — only relevant during cold-start when many entities all need extraction at once.
+
+### Extraction completes but meta has `null` everywhere
+
+The model couldn't read the source. Cases:
+- Scanned PDF is too low-resolution for the vision model to extract reliably. Re-scan at higher DPI.
+- Source is encrypted/password-protected. Drive can return it but the model can't parse it.
+- Source is in a language the model handles poorly. Try a stronger model (`gpt-4o`, `claude-3-5-sonnet`).
+
+### Same entity gets re-extracted on every cycle
+
+`safeParse(entity.meta)` keeps failing — usually because:
+- The schema has `z.string().datetime()` and the model returned a date in a slightly different format. Loosen to `z.string()` if exact-ISO isn't required, or `.refine(s => !!Date.parse(s))` for "any parseable date."
+- A required field genuinely isn't extractable from the source. Make it optional in the schema or accept that this entity will keep getting re-processed each cycle.
+
+The trace log line (`ocr: <id> already satisfies schema, skipping`) confirms safeParse passing; absence of it on subsequent runs means the schema is still rejecting whatever the model returned.
+
+## What this plugin is NOT
+
+- **A pipeline substrate over providers.** That's AI SDK's job. `ocr` just calls `generateObject`.
+- **A schema registry.** Use [mikser-io-schemas](https://github.com/almero-digital-marketing/mikser-io-schemas) for the registry; ocr looks up by name OR accepts direct imports.
+- **A source plugin.** Entities arrive via `documents` / `files` / `mikser-io-provider-gdrive` / etc. ocr is purely a consumer.
+- **A real-time OCR endpoint.** It's lifecycle-driven (`onProcess`), runs once per cycle per changed entity. For interactive "extract from this image right now," call AI SDK's `generateObject` directly.
+
+## License
+
+MIT
