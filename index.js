@@ -24,7 +24,7 @@
 
 import { generateObject } from 'ai'
 import { readEntityContent } from 'mikser-io'
-import { pickMatch, resolveSchema } from './lib/resolve.js'
+import { pickMatch, resolveSchema, normalizeMatchValue } from './lib/resolve.js'
 import { buildMessages } from './lib/messages.js'
 
 export function ocr(options = {}) {
@@ -63,12 +63,16 @@ export function ocr(options = {}) {
                 const hit = pickMatch(entity, options.match)
                 if (!hit) continue
 
-                // Resolve schema once per entity. Throws if the spec
-                // is misconfigured — let it crash the cycle rather
+                // A match value is either a bare schema (string name |
+                // zod) or a { schema, prompt } wrapper carrying a
+                // per-pattern prompt override. Normalize, then resolve
+                // the schema spec. resolveSchema throws on a
+                // misconfigured spec — let it crash the cycle rather
                 // than silently skipping; config errors should be loud.
+                const { schemaSpec, prompt: matchPrompt } = normalizeMatchValue(hit.spec)
                 let schema
                 try {
-                    schema = resolveSchema(hit.spec, { schemasSurface, patternForError: hit.pattern })
+                    schema = resolveSchema(schemaSpec, { schemasSurface, patternForError: hit.pattern })
                 } catch (err) {
                     logger.error('ocr: %s', err.message)
                     continue
@@ -91,10 +95,12 @@ export function ocr(options = {}) {
                     continue
                 }
 
+                // Prompt precedence: per-match override → plugin-level
+                // prompt → buildMessages' built-in DEFAULT_PROMPT.
                 const messages = await buildMessages({
                     entity,
                     contentResult,
-                    prompt: options.prompt,
+                    prompt: matchPrompt ?? options.prompt,
                 })
                 if (!messages) {
                     logger.trace('ocr: %s has no extractable content, skipping', entity.id)

@@ -199,17 +199,28 @@ ocr({
     //   custom providers — anything matching AI SDK's LanguageModelV2 interface
     model: openai('gpt-4o-mini'),
 
-    // REQUIRED. Glob → schema map. Schema can be a string (name, looked up
-    // via runtime.options.schemas.lookup) or a zod object (direct).
+    // REQUIRED. Glob → schema map. A match value is one of:
+    //   - a string  → schema name, looked up via runtime.options.schemas.lookup
+    //   - a zod object → used directly
+    //   - { schema, prompt } → schema (string | zod) plus a per-pattern
+    //                          prompt that overrides the plugin-level one
+    // First glob that fires against the entity id wins (first-wins,
+    // like mikser-io-layouts' autoLayouts).
     match: {
-        '/documents/invoices/**/*.pdf': 'invoice',
-        '/documents/contracts/**/*':    contractSchema,
+        '/documents/invoices/**/*.pdf': 'invoice',          // default prompt
+        '/documents/contracts/**/*':    contractSchema,     // default prompt
+        '/documents/receipts/**/*.jpg': {                   // per-pattern prompt
+            schema: 'receipt',
+            prompt: 'Extract line items. The summed items must equal the printed total.',
+        },
     },
 
-    // OPTIONAL. Override the default extraction prompt. Default is
-    // "Extract structured data from this source matching the provided
-    //  schema. Use null for any field that is genuinely not present
-    //  rather than inferring from context."
+    // OPTIONAL. The default extraction prompt for every pattern that
+    // doesn't set its own. Precedence: a per-match `prompt` (above) →
+    // this plugin-level `prompt` → the built-in default ("Extract
+    // structured data from this source matching the provided schema.
+    // Use null for any field that is genuinely not present rather than
+    // inferring from context.").
     prompt: 'Extract invoice data. Treat empty cells as null, not 0.',
 
     // OPTIONAL. Anything passed here is spread into the generateObject

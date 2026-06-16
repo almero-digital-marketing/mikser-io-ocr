@@ -3,7 +3,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { pickMatch, resolveSchema } from '../lib/resolve.js'
+import { pickMatch, resolveSchema, normalizeMatchValue } from '../lib/resolve.js'
 
 // Stand-in for a real zod schema: any object exposing safeParse.
 const fakeSchema = (name) => ({
@@ -84,5 +84,48 @@ describe('resolveSchema', () => {
             () => resolveSchema(null, { patternForError: '/invoices/**' }),
             /\/invoices\/\*\*/,
         )
+    })
+})
+
+describe('normalizeMatchValue', () => {
+    it('a string spec passes through with no prompt', () => {
+        assert.deepEqual(normalizeMatchValue('article'), { schemaSpec: 'article', prompt: undefined })
+    })
+
+    it('a bare zod schema passes through as the schemaSpec, no prompt', () => {
+        const schema = fakeSchema('invoice')
+        const out = normalizeMatchValue(schema)
+        assert.equal(out.schemaSpec, schema)
+        assert.equal(out.prompt, undefined)
+    })
+
+    it('a { schema, prompt } wrapper unwraps both', () => {
+        const schema = fakeSchema('receipt')
+        const out = normalizeMatchValue({ schema, prompt: 'Extract line items.' })
+        assert.equal(out.schemaSpec, schema)
+        assert.equal(out.prompt, 'Extract line items.')
+    })
+
+    it('a wrapper with a string schema name carries the prompt through', () => {
+        const out = normalizeMatchValue({ schema: 'receipt', prompt: 'Sum must equal total.' })
+        assert.equal(out.schemaSpec, 'receipt')
+        assert.equal(out.prompt, 'Sum must equal total.')
+    })
+
+    it('does not mistake a zod object for a wrapper (safeParse wins)', () => {
+        // A zod schema never exposes a top-level `schema` property, so
+        // the safeParse duck-type must take precedence — otherwise a
+        // schema that happened to carry a `schema` field would be
+        // misread as a wrapper.
+        const schema = fakeSchema('zoddy')
+        schema.schema = 'should-be-ignored'   // pathological, but prove the guard
+        const out = normalizeMatchValue(schema)
+        assert.equal(out.schemaSpec, schema)
+        assert.equal(out.prompt, undefined)
+    })
+
+    it('null / primitives pass through untouched for resolveSchema to reject', () => {
+        assert.deepEqual(normalizeMatchValue(null), { schemaSpec: null, prompt: undefined })
+        assert.deepEqual(normalizeMatchValue(42), { schemaSpec: 42, prompt: undefined })
     })
 })
