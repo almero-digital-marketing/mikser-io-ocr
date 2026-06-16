@@ -176,6 +176,28 @@ Three conditions; all must be true to fire:
 
 This means warm builds — second `mikser` run on the same Drive folder, no changes — call the LLM **zero times**. Only entities whose meta is incomplete relative to the schema get processed.
 
+## When the model can't read the source
+
+A strict schema is a trap: `generateObject` *forces* the model to return a value for every required field, so when the source is illegible, blank, the wrong kind of document, or corrupted, the model fabricates values to satisfy the schema — and the garbage lands on `entity.meta` looking like a real extraction. Nothing signals that anything went wrong.
+
+So the plugin doesn't hand the model your bare schema. It wraps it in a success/error envelope:
+
+```js
+{ success: boolean, error: string | null, data: <your schema> | null }
+```
+
+and appends an instruction telling the model to set `success: false` with a reason in `error` (leaving `data` null) rather than guess. `data` is only required when `success` is true, so the failure branch needs no fabrication.
+
+On a failed extraction the plugin **writes nothing** to `entity.meta` and logs a warning naming the entity, the pattern, and the model's reason:
+
+```
+ocr: /documents/invoices/blurry-scan.pdf — model could not extract (pattern /documents/invoices/**): the image is too low-resolution to read the line items
+```
+
+There's no separate error store. The entity simply stays unsatisfied — which [mikser-io-schemas](https://github.com/almero-digital-marketing/mikser-io-schemas) already surfaces as a pending/broken entity (e.g. the `mikser://schemas/pending` resource). One source of truth for "this didn't extract": the schema-validation surface you already have. A `success: true` result that somehow carries null data is treated as a failure too — a partial extraction never reaches the catalog.
+
+The envelope and instruction are automatic; nothing to configure. Your `prompt` (plugin-level or per-match) still drives *what* to extract — the failure instruction is appended on top of it.
+
 ## Multi-modal input
 
 The plugin auto-detects the source modality from what the provider's `read()` returned:
@@ -323,12 +345,15 @@ Provider rate-limited. Options:
 - Add `temperature: 0` and a tight prompt to reduce retry rate.
 - Add an explicit pause between cycles via mikser's watch interval — only relevant during cold-start when many entities all need extraction at once.
 
-### Extraction completes but meta has `null` everywhere
+### `ocr: <id> — model could not extract (pattern ...): <reason>`
 
-The model couldn't read the source. Cases:
-- Scanned PDF is too low-resolution for the vision model to extract reliably. Re-scan at higher DPI.
-- Source is encrypted/password-protected. Drive can return it but the model can't parse it.
+The model reported it couldn't process the source (see [When the model can't read the source](#when-the-model-cant-read-the-source)). Nothing was written to `entity.meta`; the entity stays unsatisfied. The reason comes from the model — common causes:
+- Scanned PDF too low-resolution for the vision model. Re-scan at higher DPI.
+- Source is encrypted/password-protected. The provider can return it but the model can't parse it.
+- Source is the wrong kind of document for the schema (a cover letter matched by an `invoices/**` glob). Tighten the match pattern.
 - Source is in a language the model handles poorly. Try a stronger model (`gpt-4o`, `claude-3-5-sonnet`).
+
+This is the *intended* path for a genuinely unreadable source — far better than the pre-1.2.0 behavior where the model fabricated values to satisfy the schema and the garbage looked like a real extraction.
 
 ### Same entity gets re-extracted on every cycle
 

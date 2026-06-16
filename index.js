@@ -26,6 +26,7 @@ import { generateObject } from 'ai'
 import { readEntityContent } from 'mikser-io'
 import { pickMatch, resolveSchema, normalizeMatchValue } from './lib/resolve.js'
 import { buildMessages } from './lib/messages.js'
+import { buildEnvelope, readEnvelope, FAILURE_INSTRUCTION } from './lib/envelope.js'
 
 export function ocr(options = {}) {
     return ({
@@ -96,11 +97,15 @@ export function ocr(options = {}) {
                 }
 
                 // Prompt precedence: per-match override → plugin-level
-                // prompt → buildMessages' built-in DEFAULT_PROMPT.
+                // prompt → buildMessages' built-in DEFAULT_PROMPT. The
+                // failure instruction is always appended so the model
+                // knows it can report an unprocessable source instead
+                // of fabricating values to satisfy the schema.
                 const messages = await buildMessages({
                     entity,
                     contentResult,
                     prompt: matchPrompt ?? options.prompt,
+                    extraInstruction: FAILURE_INSTRUCTION,
                 })
                 if (!messages) {
                     logger.trace('ocr: %s has no extractable content, skipping', entity.id)
@@ -108,14 +113,28 @@ export function ocr(options = {}) {
                 }
 
                 try {
+                    // generateObject runs against the ENVELOPE, not the
+                    // bare schema, so the model has a first-class failure
+                    // branch. On failure we write nothing — the entity
+                    // stays unsatisfied, which mikser-io-schemas already
+                    // surfaces as a pending/broken entity. No parallel
+                    // error store; the existing schema-validation surface
+                    // is the single source of truth for "this didn't
+                    // extract".
                     const { object } = await generateObject({
                         model:       options.model,
-                        schema,
+                        schema:      buildEnvelope(schema),
                         messages,
                         abortSignal: signal,
                         ...(options.generateObjectOptions ?? {}),
                     })
-                    entity.meta = { ...(entity.meta ?? {}), ...object }
+                    const outcome = readEnvelope(object)
+                    if (!outcome.ok) {
+                        logger.warn('ocr: %s — model could not extract (pattern %s): %s',
+                            entity.id, hit.pattern, outcome.reason)
+                        continue
+                    }
+                    entity.meta = { ...(entity.meta ?? {}), ...outcome.data }
                     logger.info('ocr: extracted %s (pattern %s)', entity.id, hit.pattern)
                 } catch (err) {
                     logger.error('ocr: %s — generateObject failed: %s', entity.id, err.message)
