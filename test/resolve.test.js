@@ -58,7 +58,7 @@ describe('resolveSchema', () => {
     it('throws when a string is passed but schemasSurface is missing', () => {
         assert.throws(
             () => resolveSchema('article', {}),
-            /runtime\.options\.schemas is not exposed/,
+            /the schemas service is not exposed/,
         )
     })
 

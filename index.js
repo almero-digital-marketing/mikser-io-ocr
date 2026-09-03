@@ -4,7 +4,7 @@
 //
 //   1. First-matching glob from `options.match` picks a schema.
 //   2. resolveSchema turns the spec into a zod object (string → name
-//      lookup via runtime.options.schemas.lookup; object → direct).
+//      lookup via the `schemas` service's lookup; object → direct).
 //   3. schema.safeParse(entity.meta) — if it already passes, skip.
 //      Hand-authored entities and re-runs of unchanged files don't
 //      burn LLM tokens for no reason.
@@ -23,7 +23,7 @@
 //     wherever. ocr is purely a consumer.
 
 import { generateObject } from 'ai'
-import { readEntityContent } from 'mikser-io'
+import { readEntityContent, useService } from 'mikser-io'
 import { pickMatch, resolveSchema, normalizeMatchValue } from './lib/resolve.js'
 import { buildMessages } from './lib/messages.js'
 import { buildEnvelope, readEnvelope, FAILURE_INSTRUCTION } from './lib/envelope.js'
@@ -52,7 +52,7 @@ export function ocr(options = {}) {
 
         onProcess(async (signal) => {
             const logger = useLogger()
-            const schemasSurface = runtime.options.schemas
+            const schemasSurface = useService('schemas')
 
             for await (const { entity, operation } of useJournal(
                 'OCR',
