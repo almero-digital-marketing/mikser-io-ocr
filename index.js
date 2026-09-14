@@ -27,6 +27,7 @@ import { readEntityContent, useService } from 'mikser-io'
 import { pickMatch, resolveSchema, normalizeMatchValue } from './lib/resolve.js'
 import { buildMessages } from './lib/messages.js'
 import { resolveContent } from './lib/content.js'
+import { sourceFingerprint, questionFingerprint, readLedger, writeLedger } from './lib/ledger.js'
 import { buildEnvelope, readEnvelope, FAILURE_INSTRUCTION } from './lib/envelope.js'
 
 export function ocr(options = {}) {
@@ -88,6 +89,30 @@ export function ocr(options = {}) {
                     continue
                 }
 
+                // The catalog is a derived cache and mikser wipes it on any
+                // config change, so the gate above holds only until someone
+                // edits a comment in mikser.config.js. The ledger is the
+                // second gate and it outlives the catalog: a document is read
+                // once per version of itself, whatever happens to the cache.
+                //
+                // Identity covers the document AND the question — schema,
+                // model, prompt — because a stored answer to a different
+                // question is worse than paying for the call. See lib/ledger.js.
+                const caching = options.cache !== false
+                const effectivePrompt = matchPrompt ?? options.prompt
+                const identity = caching
+                    ? questionFingerprint({ schema, model: options.model, prompt: effectivePrompt })
+                    : null
+                const source = caching ? await sourceFingerprint(entity) : null
+                if (caching) {
+                    const remembered = await readLedger(entity, identity, source)
+                    if (remembered) {
+                        entity.meta = { ...(entity.meta ?? {}), ...remembered }
+                        logger.debug('ocr: %s restored from the extraction ledger (no model call)', entity.id)
+                        continue
+                    }
+                }
+
                 // Fetch content via the scheme-dispatched provider.
                 // Returns { content } (text) | { contentSkipped, cachedAt }
                 // (binary) | { contentError } (failure).
@@ -117,7 +142,7 @@ export function ocr(options = {}) {
                 const messages = await buildMessages({
                     entity,
                     contentResult: resolved,
-                    prompt: matchPrompt ?? options.prompt,
+                    prompt: effectivePrompt,
                     extraInstruction: FAILURE_INSTRUCTION,
                 })
                 if (!messages) {
@@ -153,6 +178,10 @@ export function ocr(options = {}) {
                         continue
                     }
                     entity.meta = { ...(entity.meta ?? {}), ...outcome.data }
+                    // Recorded only after a successful extraction — a failure
+                    // is not an answer worth keeping, and the entity staying
+                    // unsatisfied is what mikser-io-schemas reports on.
+                    if (caching) await writeLedger(entity, identity, source, outcome.data)
                     logger.info('ocr: extracted %s (pattern %s)', entity.id, hit.pattern)
                 } catch (err) {
                     logger.error('ocr: %s — generateObject failed: %s', entity.id, err.message)

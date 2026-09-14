@@ -191,9 +191,40 @@ Three conditions; all must be true to fire:
 
 1. **Glob match.** `entity.id` matches a pattern in `options.match`. First match wins (deterministic insertion-order).
 2. **`safeParse` fails.** `schema.safeParse(entity.meta)` returns `success: false`. Already-validated entities don't burn tokens on re-runs.
-3. **Content available.** `readEntityContent(entity)` returns either `{ content: <text> }` or `{ cachedAt: <local path> }`. Failures (network, permissions) skip with a warning.
+3. **The ledger has no answer.** See below — this is the gate that survives a catalog wipe.
+4. **Content available.** `readEntityContent(entity)` returns either `{ content: <text> }` or `{ cachedAt: <local path> }`. A local binary is read from `entity.uri`; anything genuinely unreadable is skipped **with a warning naming the entity, the pattern it matched and the reason**.
 
 This means warm builds — second `mikser` run on the same Drive folder, no changes — call the LLM **zero times**. Only entities whose meta is incomplete relative to the schema get processed.
+
+## The extraction ledger
+
+Condition 2 is free and correct, and it holds exactly as long as the catalog
+does. mikser wipes the catalog on any config change — the files are the source
+of truth, the catalog is a derived cache — so without a ledger, editing a
+comment in `mikser.config.js` sends every matched document back to the model.
+At eight PDFs that is two minutes and a few cents; at a thousand documents it
+is a thousand model calls because someone touched an unrelated line.
+
+So a successful extraction is recorded in mikser's **durable store**
+(`mikser.data.sqlite` in the working folder), which the cache wipe does not
+touch. A document is read once per version of itself and never again.
+
+**It is not written to `out/`,** deliberately: if your sources are customer
+records and `out/` is served, anything derived from them carries the same
+constraint. Keep `mikser.data.sqlite` out of source control and out of your
+deploy's delete set.
+
+A stored result is used only when **all** of these still match:
+
+| What | Why |
+| --- | --- |
+| the document's content | `entity.checksum` — the hash mikser's import gate already computed, so this is exact and costs no extra read. Falls back to size + mtime when an entity arrives without one, and caches nothing at all when it can identify neither. |
+| the schema | A different shape is a different question. |
+| the model and provider | `openai:gpt-4o-mini` → `openai:gpt-4o` re-reads. |
+| the effective prompt | Invisible from the source file, and it changes the answer. |
+
+On by default. `ocr({ cache: false })` turns it off — the old behaviour, where
+every catalog wipe re-reads everything.
 
 ## When the model can't read the source
 
@@ -233,6 +264,11 @@ AI SDK normalizes these into provider-specific shapes (OpenAI `input_file` / `in
 
 ```js
 ocr({
+    // Remember a successful extraction in the durable store, so a catalog
+    // wipe does not send every document back to the model. Default true;
+    // see "The extraction ledger" above.
+    cache: true,
+
     // REQUIRED. AI SDK model factory result.
     //   openai('gpt-4o-mini')        — OpenAI
     //   anthropic('claude-3-5-sonnet-latest') — Anthropic
