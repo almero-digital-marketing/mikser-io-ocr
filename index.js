@@ -26,6 +26,7 @@ import { generateObject } from 'ai'
 import { readEntityContent, useService } from 'mikser-io'
 import { pickMatch, resolveSchema, normalizeMatchValue } from './lib/resolve.js'
 import { buildMessages } from './lib/messages.js'
+import { resolveContent } from './lib/content.js'
 import { buildEnvelope, readEnvelope, FAILURE_INSTRUCTION } from './lib/envelope.js'
 
 export function ocr(options = {}) {
@@ -91,8 +92,20 @@ export function ocr(options = {}) {
                 // Returns { content } (text) | { contentSkipped, cachedAt }
                 // (binary) | { contentError } (failure).
                 const contentResult = await readEntityContent(entity)
-                if (contentResult.contentError) {
-                    logger.warn('ocr: %s — cannot read content: %s', entity.id, contentResult.contentError)
+
+                // Normalize the engine's four answers into text, a path, or
+                // a reason. Handles the two cases that used to end the pass
+                // in silence: a local binary core declined to decode, and a
+                // binary a `content: true` source had already mangled into a
+                // string. See lib/content.js.
+                const resolved = await resolveContent(entity, contentResult)
+                if (resolved.skipped) {
+                    // WARN, not trace. This entity matched a pattern the
+                    // author wrote, so they have said they expect extraction
+                    // here — and the alternative is a pass that finishes in
+                    // milliseconds, extracts nothing, and reports success.
+                    logger.warn('ocr: %s matched %j but produced no model call: %s',
+                        entity.id, hit.pattern, resolved.skipped)
                     continue
                 }
 
@@ -103,12 +116,17 @@ export function ocr(options = {}) {
                 // of fabricating values to satisfy the schema.
                 const messages = await buildMessages({
                     entity,
-                    contentResult,
+                    contentResult: resolved,
                     prompt: matchPrompt ?? options.prompt,
                     extraInstruction: FAILURE_INSTRUCTION,
                 })
                 if (!messages) {
-                    logger.trace('ocr: %s has no extractable content, skipping', entity.id)
+                    // resolveContent has already ruled out every no-content
+                    // case, so reaching here means the two disagree. Loud,
+                    // because it is a bug in this plugin rather than in a
+                    // project's config.
+                    logger.warn('ocr: %s matched %j but built no message — please report this.',
+                        entity.id, hit.pattern)
                     continue
                 }
 
