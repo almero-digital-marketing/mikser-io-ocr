@@ -214,6 +214,12 @@ records and `out/` is served, anything derived from them carries the same
 constraint. Keep `mikser.data.sqlite` out of source control and out of your
 deploy's delete set.
 
+Every distinct question keeps its **own** row: the key is
+`(id, schema_hash, model, prompt_hash)`. So comparing two prompts is run A,
+run B, compare, keep the better — and going back to A costs nothing, because
+A's answers were never overwritten. `keep` (default 5) bounds how many
+answers one document accumulates, dropping the oldest first.
+
 A stored result is used only when **all** of these still match:
 
 | What | Why |
@@ -225,6 +231,32 @@ A stored result is used only when **all** of these still match:
 
 On by default. `ocr({ cache: false })` turns it off — the old behaviour, where
 every catalog wipe re-reads everything.
+
+## Concurrency and retries
+
+Extraction is serial by default (`concurrency: 1`). Raise it and N documents
+are read at once — the per-document work is independent, and provider rate
+limits are yours to size. At ~50s per report, 1000 reports is ~14 hours
+serially; that is the number `concurrency` exists for.
+
+Internally this is three passes — gather, extract concurrently, apply —
+because mikser's journal persists an entity by diffing it when the loop body
+for that entry completes. Mapping over the journal concurrently pulls the
+next entry before any body has finished, so **every** mutation is silently
+dropped (measured: 0 of 6 survived at concurrency 2). Extraction therefore
+happens off the journal and is applied in a second walk.
+
+`retries` (default 2) covers the failures that are not the document's fault.
+Measured across a day of runs with an unchanged prompt and schema, a
+*different* report failed on each run and every one succeeded when re-run
+untouched. Two failure kinds, treated differently:
+
+- a **thrown** provider or JSON error is transient — retried up to `retries`
+  times with a jittered backoff;
+- an **envelope** reporting `success: false` is the model deliberately saying
+  it cannot read the document. That is an answer, not a fault, and an
+  unreadable scan gives it every time at full price — so it is retried once
+  at most, however high `retries` goes.
 
 ## When the model can't read the source
 
@@ -268,6 +300,19 @@ ocr({
     // wipe does not send every document back to the model. Default true;
     // see "The extraction ledger" above.
     cache: true,
+
+    // How many answers to keep per document before the oldest is dropped.
+    // Default 5. Set 0 to keep every answer a document ever produced.
+    keep: 5,
+
+    // How many extractions to run at once. Default 1 — unchanged for
+    // existing users. Size it to your provider's rate limit.
+    concurrency: 1,
+
+    // Attempts after the first when a call FAILS. Default 2. A thrown
+    // provider/JSON error gets all of them; an envelope saying the model
+    // cannot read the document gets one at most, however high this goes.
+    retries: 2,
 
     // REQUIRED. AI SDK model factory result.
     //   openai('gpt-4o-mini')        — OpenAI

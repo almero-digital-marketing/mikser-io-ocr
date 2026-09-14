@@ -40,13 +40,15 @@ before(async () => {
         useNullAsDefault: true,
     })
     await knex.schema.createTable('mikser_ocr_extractions', (table) => {
-        table.text('id').primary()
+        table.text('id').notNullable()
         table.text('source').notNullable()
         table.text('schema_hash').notNullable()
         table.text('model').notNullable()
         table.text('prompt_hash').notNullable()
         table.text('result').notNullable()
         table.bigInteger('extracted_at').notNullable()
+        table.primary(['id', 'schema_hash', 'model', 'prompt_hash'])
+        table.index(['id', 'extracted_at'])
     })
     // The injection point useDurableDatabase documents.
     runtime.durable = knex
@@ -112,12 +114,86 @@ describe('the extraction ledger', () => {
             'the same bytes under a different id is a different document')
     })
 
-    it('replaces the row rather than accumulating rows per document', async () => {
+    it('replaces the row for the SAME question when the document changes', async () => {
         await writeLedger(entity, ask(), 'sum:v1', RESULT)
         await writeLedger(entity, ask(), 'sum:v2', { patient: 'A. Ivanova', findings: [] })
         const rows = await knex('mikser_ocr_extractions').where({ id: entity.id })
-        assert.equal(rows.length, 1, 'one row per document, holding its current version')
+        assert.equal(rows.length, 1, 'one row per (document, question)')
         assert.equal(rows[0].source, 'sum:v2')
+    })
+})
+
+describe('two answers for one document', () => {
+    it('keeps A when B is extracted, so a prompt change is not destructive', async () => {
+        // The reported workflow, and the one the fingerprint was built for:
+        // tighten a prompt, run it, measure it, revert. Keyed on `id` alone,
+        // B's row overwrote A's, so reverting to the EXACT previous prompt
+        // re-read everything — about thirteen model calls — and one report
+        // then failed twice and needed hand-holding to recover.
+        const source = await sourceFingerprint(entity)
+        const promptA = ask({ prompt: 'extract' })
+        const promptB = ask({ prompt: 'extract, be terse' })
+
+        await writeLedger(entity, promptA, source, RESULT)
+        await writeLedger(entity, promptB, source, { patient: 'A.I.', findings: [] })
+
+        // The revert: the old prompt's answer is still there, and free.
+        assert.deepEqual(await readLedger(entity, promptA, source), RESULT,
+            'rolling back a prompt must cost nothing')
+        assert.deepEqual(await readLedger(entity, promptB, source), { patient: 'A.I.', findings: [] })
+    })
+
+    it('keeps one answer per model, so a model comparison is reversible too', async () => {
+        const source = await sourceFingerprint(entity)
+        const mini = ask({ model: { provider: 'openai', modelId: 'gpt-4o-mini' } })
+        const full = ask({ model: { provider: 'openai', modelId: 'gpt-4o' } })
+        await writeLedger(entity, mini, source, RESULT)
+        await writeLedger(entity, full, source, { patient: 'A. Ivanova', findings: ['x'] })
+
+        assert.deepEqual(await readLedger(entity, mini, source), RESULT)
+        assert.deepEqual(await readLedger(entity, full, source), { patient: 'A. Ivanova', findings: ['x'] })
+        const rows = await knex('mikser_ocr_extractions').where({ id: entity.id })
+        assert.equal(rows.length, 2, 'both answers stand')
+    })
+
+    it('bounds the rows per document, dropping the oldest first', async () => {
+        // Unbounded growth across prompt iterations is the cost of keeping
+        // answers, and an answer from forty prompts ago is not what a
+        // rollback wants.
+        const source = await sourceFingerprint(entity)
+        for (let i = 0; i < 6; i++) {
+            await writeLedger(entity, ask({ prompt: `v${i}` }), source, { patient: `p${i}`, findings: [] }, 3)
+            // extracted_at is the prune's ordering, and these writes land
+            // inside the same millisecond otherwise.
+            await new Promise(r => setTimeout(r, 2))
+        }
+        const rows = await knex('mikser_ocr_extractions').where({ id: entity.id })
+        assert.equal(rows.length, 3, `kept ${rows.length} rows, asked to keep 3`)
+        // The three most recent survive.
+        const kept = await Promise.all([3, 4, 5].map(i =>
+            readLedger(entity, ask({ prompt: `v${i}` }), source)))
+        assert.deepEqual(kept.map(k => k?.patient), ['p3', 'p4', 'p5'])
+        assert.equal(await readLedger(entity, ask({ prompt: 'v0' }), source), null, 'the oldest went')
+    })
+
+    it('keeps everything when keep is 0 or nonsense', async () => {
+        const source = await sourceFingerprint(entity)
+        for (let i = 0; i < 4; i++) {
+            await writeLedger(entity, ask({ prompt: `k${i}` }), source, { patient: `p${i}`, findings: [] }, 0)
+        }
+        const rows = await knex('mikser_ocr_extractions').where({ id: entity.id })
+        assert.equal(rows.length, 4, 'pruning off means pruning off')
+    })
+
+    it('does not prune another document\'s rows', async () => {
+        const other = { id: '/skincheck/other.pdf', checksum: 'zzz' }
+        await writeLedger(other, ask(), await sourceFingerprint(other), RESULT, 1)
+        for (let i = 0; i < 3; i++) {
+            await writeLedger(entity, ask({ prompt: `x${i}` }), await sourceFingerprint(entity), RESULT, 1)
+            await new Promise(r => setTimeout(r, 2))
+        }
+        assert.deepEqual(await readLedger(other, ask(), await sourceFingerprint(other)), RESULT,
+            "one document's churn must not evict another's answer")
     })
 })
 
