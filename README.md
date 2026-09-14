@@ -37,6 +37,25 @@ entity.meta = { ...entity.meta, ...result } — auto-persisted by the journal
 npm install mikser-io-ocr ai @ai-sdk/openai zod
 ```
 
+**The `ai` version and the provider package have to be the same generation.**
+They are versioned separately and their `latest` tags move together, so mixing
+them fails at the first call rather than at install:
+
+```
+UnsupportedModelVersionError: Unsupported model version v4 for provider
+"anthropic.messages" ... AI SDK 5 only supports specification version "v2"
+```
+
+The command above is right when both resolve to `latest` (currently `ai@7` with
+`@ai-sdk/*@4`). If you pin `ai` to an older major, pin the provider to the
+matching dist-tag rather than `latest`:
+
+| `ai` | provider packages |
+|---|---|
+| `ai@7` (latest) | `@ai-sdk/openai@latest` — the 4.x generation |
+| `ai@6` | `npm install @ai-sdk/openai@ai-v6` — the 3.x generation |
+| `ai@5` | `npm install @ai-sdk/openai@ai-v5` |
+
 Peer dependencies — pick the provider package matching your model choice:
 
 | Provider | Package |
