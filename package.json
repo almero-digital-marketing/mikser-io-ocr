@@ -1,6 +1,6 @@
 {
   "name": "mikser-io-ocr",
-  "version": "11.5.0",
+  "version": "11.6.0",
   "description": "Schema-driven OCR + structured-data extraction for mikser-io. Walks the catalog at onProcess, matches entities to zod schemas by glob, calls Vercel AI SDK's generateObject with multi-modal input (text / PDF / image), writes the validated result onto entity.meta. Schemas can be passed by name (via mikser-io-schemas's lookup) or by direct import.",
   "main": "index.js",
   "type": "module",
