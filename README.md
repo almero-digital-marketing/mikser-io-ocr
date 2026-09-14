@@ -234,10 +234,15 @@ every catalog wipe re-reads everything.
 
 ## Concurrency and retries
 
-Extraction is serial by default (`concurrency: 1`). Raise it and N documents
-are read at once — the per-document work is independent, and provider rate
-limits are yours to size. At ~50s per report, 1000 reports is ~14 hours
-serially; that is the number `concurrency` exists for.
+Four documents are extracted at once by default (`concurrency: 4`). The
+per-document work is independent — a read, a provider call, a write — and at
+~50s per report a thousand reports is ~14 hours serially, on a cold rebuild
+that any config change triggers.
+
+Four is meant to sit under a default provider tier rather than trip its rate
+limit. Raise it when you know your budget; set `concurrency: 1` for strictly
+serial extraction. A provider that does start refusing has `retries` with
+jittered backoff in front of it.
 
 Internally this is three passes — gather, extract concurrently, apply —
 because mikser's journal persists an entity by diffing it when the loop body
@@ -305,9 +310,9 @@ ocr({
     // Default 5. Set 0 to keep every answer a document ever produced.
     keep: 5,
 
-    // How many extractions to run at once. Default 1 — unchanged for
-    // existing users. Size it to your provider's rate limit.
-    concurrency: 1,
+    // How many extractions to run at once. Default 4. Size it to your
+    // provider's rate limit; 1 is strictly serial.
+    concurrency: 4,
 
     // Attempts after the first when a call FAILS. Default 2. A thrown
     // provider/JSON error gets all of them; an envelope saying the model

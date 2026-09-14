@@ -30,6 +30,35 @@ import { buildMessages } from './lib/messages.js'
 import { resolveContent } from './lib/content.js'
 import { sourceFingerprint, questionFingerprint, readLedger, writeLedger } from './lib/ledger.js'
 import { extractWithRetry, DEFAULT_RETRIES } from './lib/attempt.js'
+
+// How many extractions run at once when nothing says otherwise.
+//
+// Four, not one. Serial was the cautious default and the caution was
+// misplaced: the per-document work is a read, a provider call and a write,
+// with nothing shared between documents, and at ~50s per report a thousand
+// reports is fourteen hours of a cold rebuild — which happens on any config
+// change, because the catalog is wiped and only the ledger saves it.
+//
+// Low enough to sit under a default provider tier rather than being the
+// thing that trips its rate limit; `concurrency` is there to raise when the
+// budget is known. A provider that does start refusing now has retries with
+// jittered backoff in front of it, which is the other half of why this can
+// move.
+export const DEFAULT_CONCURRENCY = 4
+
+// Whatever the config said, turned into a usable worker count.
+//
+// Guards the values that would otherwise be taken literally: 0 and negatives
+// (p-map rejects them), NaN from a bad env var, and fractions. A malformed
+// setting falls back to the default rather than stopping the build — the
+// worst outcome of getting this wrong is a slower or faster pass, never a
+// wrong one, so refusing to run would be the larger harm.
+export function resolveConcurrency(value) {
+    if (value === undefined || value === null) return DEFAULT_CONCURRENCY
+    const n = Math.trunc(Number(value))
+    if (!Number.isFinite(n) || n < 1) return 1
+    return n
+}
 import { buildEnvelope, readEnvelope, FAILURE_INSTRUCTION } from './lib/envelope.js'
 
 export function ocr(options = {}) {
@@ -57,7 +86,7 @@ export function ocr(options = {}) {
         onProcess(async (signal) => {
             const logger = useLogger()
             const schemasSurface = useService('schemas')
-            const concurrency = Math.max(1, Math.trunc(options.concurrency ?? 1) || 1)
+            const concurrency = resolveConcurrency(options.concurrency)
 
             // THREE PASSES, and the shape is not decoration.
             //
