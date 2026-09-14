@@ -232,6 +232,66 @@ A stored result is used only when **all** of these still match:
 On by default. `ocr({ cache: false })` turns it off — the old behaviour, where
 every catalog wipe re-reads everything.
 
+## A sequence of questions about one entity
+
+A match value may be an ordered list of **steps**, each with its own schema,
+its own prompt and its own ledger row:
+
+```js
+ocr({
+    model: MODEL(),
+    match: {
+        '/skincheck/Janus/**/*.pdf': [
+            { name: 'report', schema: janusReport, prompt: JANUS_PROMPT },
+            { name: 'notes', schema: findingNotes, source: false,
+              prompt: (entity) => `${NOTES_PROMPT}
+                  Измервания: ${JSON.stringify(entity.meta.measures)}
+                  Находки: ${entity.meta.findings.join('\n')}` },
+        ],
+    },
+})
+```
+
+Steps run **in order within one entity** — a later step reads what the
+earlier ones left on `entity.meta` — while `concurrency` applies across
+entities, which is where the independence actually is.
+
+- **`prompt` may be a function of the entity.** A derived question is derived
+  from something. A string prompt is resolved before any document is seen, so
+  every match gets the same question; a function gets the entity with each
+  earlier step's answer already merged.
+
+- **`source: false`** asks about what earlier steps put on meta rather than
+  about the document. Re-attaching a 4 MB PDF to ask about a hundred bytes of
+  JSON already in hand pays for the whole thing twice.
+
+- **`name` is the identity**, and is required in a sequence. It goes into the
+  ledger key, so steps are numbered by name rather than by position —
+  reordering the array must not discard paid-for answers. An unnamed step in
+  a sequence is refused rather than guessed at.
+
+**Steps that are not model calls stay in your pipeline.** This does not try
+to absorb ordinary code. If deriving findings from measurements is code —
+and it should be, if asking the model gave five findings one run and two the
+next from identical input — keep it as a plugin between two `ocr()` phases.
+
+**A step whose inputs are not ready skips quietly.** Return `null` from the
+prompt function and the step is skipped at debug level, to be picked up on
+the next cycle, exactly as an unsatisfied schema already is. A prompt
+function that *throws* is reported as a warning instead: reading
+`meta.findings.join()` before findings exists is the accidental way to say
+"not ready", but it is also exactly what a typo looks like.
+
+Each step caches on its own key, `(id, step, schema, model, prompt)`, over
+the **resolved** prompt. So editing a late step's prompt re-runs that step
+and leaves the expensive first reading alone — and `keep` is a budget *per
+step*, so iterating on a cheap late question cannot age out the answer that
+actually opened the PDF.
+
+> The name stopped fitting once a match became a conversation. `extract` is
+> exported as an alias of `ocr` — same implementation, better word. `ocr`
+> is not going anywhere.
+
 ## Concurrency and retries
 
 Four documents are extracted at once by default (`concurrency: 4`). The

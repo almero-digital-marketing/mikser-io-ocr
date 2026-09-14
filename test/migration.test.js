@@ -49,24 +49,27 @@ describe('migrating a 11.3.0 ledger', () => {
         await knex(TABLE).insert(before)
 
         await migrations[1].up(knex)
+        await migrations[2].up(knex)
 
         const after = await knex(TABLE).orderBy('id')
         assert.equal(after.length, 2, 'no answer may be lost in the rebuild')
         assert.deepEqual(after.map(r => r.id).sort(),
             ['/skincheck/8501054473.pdf', '/skincheck/other.pdf'])
         assert.equal(JSON.parse(after.find(r => r.id === '/skincheck/other.pdf').result).patient, 'B. Petrov')
+        assert.deepEqual([...new Set(after.map(r => r.step))], [''],
+            'rows from before sequences keep the empty step, so they stay reachable')
     })
 
     it('leaves a table that accepts two questions for one document', async () => {
         // The point of the whole migration.
-        await knex(TABLE).insert(row({ prompt_hash: 'ph2', result: JSON.stringify({ patient: 'variant' }) }))
+        await knex(TABLE).insert(row({ step: '', prompt_hash: 'ph2', result: JSON.stringify({ patient: 'variant' }) }))
         const rows = await knex(TABLE).where({ id: '/skincheck/8501054473.pdf' })
         assert.equal(rows.length, 2)
     })
 
     it('still refuses a duplicate of the same document AND question', async () => {
         await assert.rejects(
-            () => knex(TABLE).insert(row({ prompt_hash: 'ph2', extracted_at: Date.now() + 1 })),
+            () => knex(TABLE).insert(row({ step: '', prompt_hash: 'ph2', extracted_at: Date.now() + 1 })),
             /UNIQUE|constraint/i,
             'the composite key must still be a key')
     })
@@ -78,8 +81,7 @@ describe('migrating a 11.3.0 ledger', () => {
             useNullAsDefault: true,
         })
         try {
-            await migrations[0].up(fresh)
-            await migrations[1].up(fresh)
+            for (const migration of migrations) await migration.up(fresh)
             assert.deepEqual(await fresh(TABLE).select('*'), [])
         } finally { await fresh.destroy() }
     })

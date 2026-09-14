@@ -25,7 +25,8 @@
 import pMap from 'p-map'
 import { generateObject } from 'ai'
 import { readEntityContent, useService } from 'mikser-io'
-import { pickMatch, resolveSchema, normalizeMatchValue } from './lib/resolve.js'
+import { pickMatch, resolveSchema } from './lib/resolve.js'
+import { normalizeSteps, resolvePrompt } from './lib/steps.js'
 import { buildMessages } from './lib/messages.js'
 import { resolveContent } from './lib/content.js'
 import { sourceFingerprint, questionFingerprint, readLedger, writeLedger } from './lib/ledger.js'
@@ -60,6 +61,13 @@ export function resolveConcurrency(value) {
     return n
 }
 import { buildEnvelope, readEnvelope, FAILURE_INSTRUCTION } from './lib/envelope.js'
+
+// The name stopped fitting once a match became a conversation. `extract` is
+// the same implementation under the word that describes it: reading a
+// document is one of the questions it asks, not the whole job. `ocr` stays,
+// because renaming a published entry point would break every consumer to buy
+// nothing.
+export const extract = (...args) => ocr(...args)
 
 export function ocr(options = {}) {
     return ({
@@ -130,143 +138,163 @@ export function ocr(options = {}) {
             await pMap(pending, async ({ entity, hit }) => {
                 if (signal.aborted) return
 
-                // A match value is either a bare schema (string name |
-                // zod) or a { schema, prompt } wrapper carrying a
-                // per-pattern prompt override. Normalize, then resolve
-                // the schema spec. resolveSchema throws on a
-                // misconfigured spec — let it crash the cycle rather
-                // than silently skipping; config errors should be loud.
-                const { schemaSpec, prompt: matchPrompt } = normalizeMatchValue(hit.spec)
-                let schema
+                // A match is a SEQUENCE of questions — see lib/steps.js.
+                // Every form that worked before is a sequence of one, so the
+                // single-value shapes are unchanged.
+                let steps
                 try {
-                    schema = resolveSchema(schemaSpec, { schemasSurface, patternForError: hit.pattern })
+                    steps = normalizeSteps(hit.spec, { patternForError: hit.pattern })
                 } catch (err) {
                     logger.error('ocr: %s', err.message)
                     return
                 }
 
-                // Already-satisfied entities skip the LLM call entirely.
-                // This is the read-mostly path on warm builds — most
-                // entities already have valid meta and don't need re-ext.
-                if (schema.safeParse(entity.meta ?? {}).success) {
-                    logger.trace('ocr: %s already satisfies schema, skipping', entity.id)
-                    return
-                }
-
-                // The catalog is a derived cache and mikser wipes it on any
-                // config change, so the gate above holds only until someone
-                // edits a comment in mikser.config.js. The ledger is the
-                // second gate and it outlives the catalog: a document is read
-                // once per version of itself, whatever happens to the cache.
+                // Steps run IN ORDER within one entity, because a later step
+                // reads what the earlier ones left. Concurrency is across
+                // entities, which is where the independence actually is.
                 //
-                // Identity covers the document AND the question — schema,
-                // model, prompt — because a stored answer to a different
-                // question is worse than paying for the call. See lib/ledger.js.
-                const caching = options.cache !== false
-                const effectivePrompt = matchPrompt ?? options.prompt
-                const identity = caching
-                    ? questionFingerprint({ schema, model: options.model, prompt: effectivePrompt })
-                    : null
-                const source = caching ? await sourceFingerprint(entity) : null
-                if (caching) {
-                    const remembered = await readLedger(entity, identity, source)
-                    if (remembered) {
-                        extracted.set(entity.id, remembered)
-                        logger.debug('ocr: %s restored from the extraction ledger (no model call)', entity.id)
+                // `meta` accumulates as we go: step three has to see step
+                // one's answer, and the entity object itself is not mutated
+                // until pass three.
+                let meta = { ...(entity.meta ?? {}) }
+                let produced = null
+
+                for (const step of steps) {
+                    if (signal.aborted) return
+                    const label = step.name ? `${hit.pattern}#${step.name}` : hit.pattern
+                    const view = { ...entity, meta }
+
+                    let schema
+                    try {
+                        schema = resolveSchema(step.schemaSpec, { schemasSurface, patternForError: label })
+                    } catch (err) {
+                        logger.error('ocr: %s', err.message)
                         return
+                    }
+
+                    // Already-satisfied steps skip the call entirely. This is
+                    // the read-mostly path on warm builds.
+                    if (schema.safeParse(meta).success) {
+                        logger.trace('ocr: %s already satisfies %s, skipping', entity.id, label)
+                        continue
+                    }
+
+                    // A prompt may be a function of the entity, because a
+                    // derived question is derived from something — and that
+                    // is also how a step says it is not ready yet.
+                    const asked = resolvePrompt(step, view, options.prompt)
+                    if (asked.skip) {
+                        // Quiet: a step waiting for an earlier one is the
+                        // normal state of a pipeline mid-build, and the next
+                        // cycle picks it up.
+                        logger.debug('ocr: %s skipping %s — %s', entity.id, label, asked.skip)
+                        continue
+                    }
+                    if (asked.failed) {
+                        // Not fatal — the inputs may exist next cycle — but
+                        // not silent either, because a typo in the prompt
+                        // throws exactly the same way.
+                        logger.warn('ocr: %s could not build the prompt for %s: %s',
+                            entity.id, label, asked.failed)
+                        continue
+                    }
+
+                    const caching = options.cache !== false
+                    const identity = caching
+                        ? questionFingerprint({
+                            schema, model: options.model, prompt: asked.prompt, step: step.name })
+                        : null
+                    const source = caching ? await sourceFingerprint(entity) : null
+                    if (caching) {
+                        const remembered = await readLedger(entity, identity, source)
+                        if (remembered) {
+                            meta = { ...meta, ...remembered }
+                            produced = { ...(produced ?? {}), ...remembered }
+                            logger.debug('ocr: %s %s restored from the ledger (no model call)',
+                                entity.id, label)
+                            continue
+                        }
+                    }
+
+                    // `source: false` asks about what earlier steps put on
+                    // meta, not about the document. Attaching a 4 MB PDF
+                    // again to ask about a hundred bytes of JSON already in
+                    // hand pays for the whole thing twice.
+                    let resolved = { content: '' }
+                    if (step.source) {
+                        const contentResult = await readEntityContent(entity)
+                        resolved = await resolveContent(entity, contentResult)
+                        if (resolved.skipped) {
+                            // WARN, not trace. This entity matched a pattern
+                            // the author wrote, so they have said they expect
+                            // extraction here — and the alternative is a pass
+                            // that finishes in milliseconds, extracts
+                            // nothing, and reports success.
+                            logger.warn('ocr: %s matched %j but produced no model call: %s',
+                                entity.id, label, resolved.skipped)
+                            continue
+                        }
+                    }
+
+                    const messages = await buildMessages({
+                        entity: view,
+                        contentResult: step.source ? resolved : null,
+                        prompt: asked.prompt,
+                        extraInstruction: FAILURE_INSTRUCTION,
+                    })
+                    if (!messages) {
+                        logger.warn('ocr: %s matched %j but built no message — please report this.',
+                            entity.id, label)
+                        continue
+                    }
+
+                    // Retried, because these failures were measured to be
+                    // transient: a different report failed on each run and
+                    // every one succeeded when re-run unchanged, while the
+                    // page it fed rendered empty until somebody noticed. See
+                    // lib/attempt.js for why a throw and an envelope failure
+                    // are not retried the same number of times.
+                    const result = await extractWithRetry({
+                        retries: options.retries ?? DEFAULT_RETRIES,
+                        signal,
+                        onRetry: ({ attempt, reason, threw }) => {
+                            logger.warn('ocr: %s %s attempt %d failed (%s), retrying: %s',
+                                entity.id, label, attempt,
+                                threw ? 'provider error' : 'model reported failure', reason)
+                        },
+                        call: async () => {
+                            const { object } = await generateObject({
+                                model:       options.model,
+                                schema:      buildEnvelope(schema),
+                                messages,
+                                abortSignal: signal,
+                                ...(options.generateObjectOptions ?? {}),
+                            })
+                            return readEnvelope(object)
+                        },
+                    })
+
+                    if (result.ok) {
+                        meta = { ...meta, ...result.data }
+                        produced = { ...(produced ?? {}), ...result.data }
+                        if (caching) await writeLedger(entity, identity, source, result.data, options.keep)
+                        logger.info('ocr: extracted %s (%s)%s', entity.id, label,
+                            result.attempts > 1 ? ` after ${result.attempts} attempts` : '')
+                    } else if (result.threw) {
+                        logger.error('ocr: %s %s — generateObject failed after %d attempt(s): %s',
+                            entity.id, label, result.attempts, result.reason)
+                        // Later steps read what this one was going to leave,
+                        // so carrying on would ask a question about an answer
+                        // that does not exist.
+                        break
+                    } else {
+                        logger.warn('ocr: %s %s — model could not extract after %d attempt(s): %s',
+                            entity.id, label, result.attempts, result.reason)
+                        break
                     }
                 }
 
-                // Fetch content via the scheme-dispatched provider.
-                // Returns { content } (text) | { contentSkipped, cachedAt }
-                // (binary) | { contentError } (failure).
-                const contentResult = await readEntityContent(entity)
-
-                // Normalize the engine's four answers into text, a path, or
-                // a reason. Handles the two cases that used to end the pass
-                // in silence: a local binary core declined to decode, and a
-                // binary a `content: true` source had already mangled into a
-                // string. See lib/content.js.
-                const resolved = await resolveContent(entity, contentResult)
-                if (resolved.skipped) {
-                    // WARN, not trace. This entity matched a pattern the
-                    // author wrote, so they have said they expect extraction
-                    // here — and the alternative is a pass that finishes in
-                    // milliseconds, extracts nothing, and reports success.
-                    logger.warn('ocr: %s matched %j but produced no model call: %s',
-                        entity.id, hit.pattern, resolved.skipped)
-                    return
-                }
-
-                // Prompt precedence: per-match override → plugin-level
-                // prompt → buildMessages' built-in DEFAULT_PROMPT. The
-                // failure instruction is always appended so the model
-                // knows it can report an unprocessable source instead
-                // of fabricating values to satisfy the schema.
-                const messages = await buildMessages({
-                    entity,
-                    contentResult: resolved,
-                    prompt: effectivePrompt,
-                    extraInstruction: FAILURE_INSTRUCTION,
-                })
-                if (!messages) {
-                    // resolveContent has already ruled out every no-content
-                    // case, so reaching here means the two disagree. Loud,
-                    // because it is a bug in this plugin rather than in a
-                    // project's config.
-                    logger.warn('ocr: %s matched %j but built no message — please report this.',
-                        entity.id, hit.pattern)
-                    return
-                }
-
-                // generateObject runs against the ENVELOPE, not the bare
-                // schema, so the model has a first-class failure branch. On
-                // failure we write nothing — the entity stays unsatisfied,
-                // which mikser-io-schemas already surfaces as a
-                // pending/broken entity. No parallel error store; the
-                // existing schema-validation surface is the single source of
-                // truth for "this didn't extract".
-                //
-                // Retried, because these failures were measured to be
-                // transient: a different report failed on each run and every
-                // one succeeded when re-run unchanged, while the page it fed
-                // rendered empty until somebody noticed. See lib/attempt.js
-                // for why a throw and an envelope failure are not retried the
-                // same number of times.
-                const result = await extractWithRetry({
-                    retries: options.retries ?? DEFAULT_RETRIES,
-                    signal,
-                    onRetry: ({ attempt, reason, threw }) => {
-                        logger.warn('ocr: %s attempt %d failed (%s), retrying: %s',
-                            entity.id, attempt, threw ? 'provider error' : 'model reported failure', reason)
-                    },
-                    call: async () => {
-                        const { object } = await generateObject({
-                            model:       options.model,
-                            schema:      buildEnvelope(schema),
-                            messages,
-                            abortSignal: signal,
-                            ...(options.generateObjectOptions ?? {}),
-                        })
-                        return readEnvelope(object)
-                    },
-                })
-
-                if (result.ok) {
-                    extracted.set(entity.id, result.data)
-                    // Recorded only after a successful extraction — a failure
-                    // is not an answer worth keeping, and the entity staying
-                    // unsatisfied is what mikser-io-schemas reports on.
-                    if (caching) await writeLedger(entity, identity, source, result.data, options.keep)
-                    logger.info('ocr: extracted %s (pattern %s)%s', entity.id, hit.pattern,
-                        result.attempts > 1 ? ` after ${result.attempts} attempts` : '')
-                } else if (result.threw) {
-                    logger.error('ocr: %s — generateObject failed after %d attempt(s): %s',
-                        entity.id, result.attempts, result.reason)
-                } else {
-                    logger.warn('ocr: %s — model could not extract (pattern %s) after %d attempt(s): %s',
-                        entity.id, hit.pattern, result.attempts, result.reason)
-                }
+                if (produced) extracted.set(entity.id, produced)
             }, { concurrency, signal })
 
             if (!extracted.size) return

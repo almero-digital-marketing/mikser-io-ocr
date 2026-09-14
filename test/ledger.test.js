@@ -23,7 +23,7 @@ import knexFactory from 'knex'
 import { z } from 'zod'
 import runtime from 'mikser-io/src/runtime.js'
 
-import { sourceFingerprint, questionFingerprint, readLedger, writeLedger } from '../lib/ledger.js'
+import { sourceFingerprint, questionFingerprint, readLedger, writeLedger, migrations } from '../lib/ledger.js'
 
 const SCHEMA = z.object({ patient: z.string(), findings: z.array(z.string()) })
 const OTHER_SCHEMA = z.object({ patient: z.string(), findings: z.array(z.string()), grade: z.number() })
@@ -39,17 +39,11 @@ before(async () => {
         connection: { filename: path.join(dir, 'mikser.data.sqlite') },
         useNullAsDefault: true,
     })
-    await knex.schema.createTable('mikser_ocr_extractions', (table) => {
-        table.text('id').notNullable()
-        table.text('source').notNullable()
-        table.text('schema_hash').notNullable()
-        table.text('model').notNullable()
-        table.text('prompt_hash').notNullable()
-        table.text('result').notNullable()
-        table.bigInteger('extracted_at').notNullable()
-        table.primary(['id', 'schema_hash', 'model', 'prompt_hash'])
-        table.index(['id', 'extracted_at'])
-    })
+    // Built by running the real migrations, not by hand. A hand-written
+    // copy of the schema drifts from the one users get, and the drift is
+    // invisible until a column the code writes is missing in production.
+    for (const migration of migrations) await migration.up(knex)
+
     // The injection point useDurableDatabase documents.
     runtime.durable = knex
 })
@@ -194,6 +188,79 @@ describe('two answers for one document', () => {
         }
         assert.deepEqual(await readLedger(other, ask(), await sourceFingerprint(other)), RESULT,
             "one document's churn must not evict another's answer")
+    })
+})
+
+describe('one document, several questions', () => {
+    it('keeps each step\'s answer under its own key', async () => {
+        const source = await sourceFingerprint(entity)
+        const report = ask({ step: 'report' })
+        const notes = ask({ step: 'notes', prompt: 'explain the findings' })
+        await writeLedger(entity, report, source, RESULT)
+        await writeLedger(entity, notes, source, { notes: ['benign'] })
+
+        assert.deepEqual(await readLedger(entity, report, source), RESULT)
+        assert.deepEqual(await readLedger(entity, notes, source), { notes: ['benign'] })
+    })
+
+    it('does not let a churning late step evict the expensive first reading', async () => {
+        // The reason `step` is in the key at all. Without it the prune keeps
+        // the newest N rows PER DOCUMENT, so iterating on step three's prompt
+        // a few times ages out step one's answer — the one that actually read
+        // the 4 MB PDF — and the next build pays to read it again.
+        const source = await sourceFingerprint(entity)
+        const report = ask({ step: 'report' })
+        await writeLedger(entity, report, source, RESULT, 2)
+
+        for (let i = 0; i < 6; i++) {
+            await writeLedger(entity, ask({ step: 'notes', prompt: `v${i}` }), source,
+                { notes: [`v${i}`] }, 2)
+            await new Promise(r => setTimeout(r, 2))
+        }
+
+        assert.deepEqual(await readLedger(entity, report, source), RESULT,
+            'the expensive reading must survive any amount of churn on a later step')
+        const notesRows = await knex('mikser_ocr_extractions').where({ id: entity.id, step: 'notes' })
+        assert.equal(notesRows.length, 2, 'the late step is still bounded, on its own')
+    })
+
+    it('gives each step its own keep budget, not a shared one', async () => {
+        // Sharper than "a late step must not evict an early one", which the
+        // delete's own scoping already prevents. The budget is the leak: if
+        // the prune counts rows across steps, a BUSY sibling written more
+        // recently fills the budget and the step being pruned is cut below
+        // its own `keep` — here to zero rows from a limit of two.
+        const source = await sourceFingerprint(entity)
+        const notes = (v) => ask({ step: 'notes', prompt: v })
+
+        await writeLedger(entity, notes('v0'), source, { notes: ['v0'] }, 2)
+        await new Promise(r => setTimeout(r, 2))
+        await writeLedger(entity, notes('v1'), source, { notes: ['v1'] }, 2)
+        await new Promise(r => setTimeout(r, 2))
+        // A different step, written later, so it sits on top of any
+        // document-wide ordering.
+        for (const v of ['r0', 'r1', 'r2']) {
+            await writeLedger(entity, ask({ step: 'report', prompt: v }), source, { report: v }, 2)
+            await new Promise(r => setTimeout(r, 2))
+        }
+        // Now prune `notes`.
+        await writeLedger(entity, notes('v2'), source, { notes: ['v2'] }, 2)
+
+        const kept = await knex('mikser_ocr_extractions').where({ id: entity.id, step: 'notes' })
+        assert.equal(kept.length, 2,
+            `notes kept ${kept.length} of its own 2 — a sibling step consumed its budget`)
+        assert.deepEqual(await readLedger(entity, notes('v2'), source), { notes: ['v2'] })
+        assert.deepEqual(await readLedger(entity, notes('v1'), source), { notes: ['v1'] })
+    })
+
+    it('treats the legacy empty step as its own step', async () => {
+        // Rows written before sequences existed carry the empty name, and a
+        // named step must not collide with them.
+        const source = await sourceFingerprint(entity)
+        await writeLedger(entity, ask(), source, RESULT)
+        await writeLedger(entity, ask({ step: 'notes' }), source, { notes: [] })
+        assert.deepEqual(await readLedger(entity, ask(), source), RESULT)
+        assert.deepEqual(await readLedger(entity, ask({ step: 'notes' }), source), { notes: [] })
     })
 })
 
