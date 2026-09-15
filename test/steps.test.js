@@ -15,7 +15,7 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { z } from 'zod'
 
-import { normalizeSteps, resolvePrompt, LEGACY_STEP } from '../lib/steps.js'
+import { normalizeSteps, resolvePrompt, cacheKeyFor, LEGACY_STEP } from '../lib/steps.js'
 
 const A = z.object({ a: z.string() })
 const B = z.object({ b: z.string() })
@@ -62,6 +62,35 @@ describe('normalizeSteps', () => {
 
     it('refuses an empty sequence', () => {
         assert.throws(() => normalizeSteps([]), /empty array/)
+    })
+})
+
+describe('the `key` lever', () => {
+    it('carries an explicit cache key through', () => {
+        const [step] = normalizeSteps([{ name: 'notes', schema: A, prompt: 'long guidance', key: 'notes-v2' }])
+        assert.equal(step.key, 'notes-v2')
+    })
+
+    it('stands in for the prompt in the cache identity', () => {
+        // The wiring, not just the field: with a key, the ledger identity is
+        // the key; without one it is the prompt text, so a reworded prompt
+        // still invalidates by default.
+        const [withKey] = normalizeSteps([{ name: 'n', schema: A, prompt: 'v1 guidance', key: 'notes-v2' }])
+        assert.equal(cacheKeyFor(withKey, 'v1 guidance'), 'notes-v2')
+        assert.equal(cacheKeyFor(withKey, 'totally reworded guidance'), 'notes-v2',
+            'rewording must not invalidate once the author has taken control')
+
+        const [noKey] = normalizeSteps([{ name: 'n', schema: A, prompt: 'v1 guidance' }])
+        assert.equal(cacheKeyFor(noKey, 'v1 guidance'), 'v1 guidance')
+        assert.equal(cacheKeyFor(noKey, 'reworded'), 'reworded', 'default stays prompt-sensitive')
+    })
+
+    it('is absent unless asked for, so the prompt stays the identity', () => {
+        // Default must not change: a prompt edit invalidates, because a
+        // prompt's effect is unbounded and cannot be checked against a
+        // stored answer the way a schema can.
+        assert.equal(normalizeSteps([{ name: 'n', schema: A, prompt: 'p' }])[0].key, undefined)
+        assert.equal(normalizeSteps(A)[0].key, undefined)
     })
 })
 

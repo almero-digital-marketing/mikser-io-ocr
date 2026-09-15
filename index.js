@@ -26,10 +26,11 @@ import pMap from 'p-map'
 import { generateObject } from 'ai'
 import { readEntityContent, useService } from 'mikser-io'
 import { pickMatch, resolveSchema } from './lib/resolve.js'
-import { normalizeSteps, resolvePrompt } from './lib/steps.js'
+import { normalizeSteps, resolvePrompt, cacheKeyFor } from './lib/steps.js'
+import { planFromPriors, satisfies } from './lib/backfill.js'
 import { buildMessages } from './lib/messages.js'
 import { resolveContent } from './lib/content.js'
-import { sourceFingerprint, questionFingerprint, readLedger, writeLedger } from './lib/ledger.js'
+import { sourceFingerprint, questionFingerprint, readLedger, writeLedger, readPriorAnswers } from './lib/ledger.js'
 import { extractWithRetry, DEFAULT_RETRIES } from './lib/attempt.js'
 
 // How many extractions run at once when nothing says otherwise.
@@ -64,6 +65,22 @@ export const DEFAULT_CONCURRENCY = 4
 // others — four full reads, all billed, all but one discarded.
 //
 // Last entry wins: later rows carry later state, and it is the same file.
+// Said ONCE per step, the first time a schema change is found to need work.
+//
+// Nothing warned at all before: twelve documents was a shrug, a thousand
+// would have been six and a half hours nobody asked for. The count is the
+// documents in this pass, which is the upper bound on what will be read.
+const schemaChangeReported = new Set()
+function reportSchemaChange(logger, label, documents, fields) {
+    if (schemaChangeReported.has(label)) return
+    schemaChangeReported.add(label)
+    logger.notice(
+        { code: 'ocr-schema-changed', step: label, documents, fields },
+        'ocr: the schema for %s changed — up to %d document(s) will be asked again, for %j. '
+        + 'Fields the stored answers already satisfy are not re-read.',
+        label, documents, fields)
+}
+
 export function addPending(pending, entity, match) {
     if (!entity?.id) return pending
     const hit = pickMatch(entity, match)
@@ -228,9 +245,19 @@ export function ocr(options = {}) {
                     const caching = options.cache !== false
                     const identity = caching
                         ? questionFingerprint({
-                            schema, model: options.model, prompt: asked.prompt, step: step.name })
+                            schema, model: options.model,
+                            // `key` stands in for the prompt when the author
+                            // declared one — see lib/steps.js.
+                            prompt: cacheKeyFor(step, asked.prompt),
+                            step: step.name })
                         : null
                     const source = caching ? await sourceFingerprint(entity) : null
+                    // What the model will actually be asked, if anything. A
+                    // full schema by default; a backfill narrows it to the
+                    // fields a previous generation's answer does not already
+                    // provide.
+                    let asking = schema
+                    let basis = null
                     if (caching) {
                         const remembered = await readLedger(entity, identity, source)
                         if (remembered) {
@@ -239,6 +266,30 @@ export function ocr(options = {}) {
                             logger.debug('ocr: %s %s restored from the ledger (no model call)',
                                 entity.id, label)
                             continue
+                        }
+
+                        // Missed on the schema. Before paying to read the
+                        // document again, ask whether a previous generation's
+                        // answer is still a valid answer to the question as it
+                        // is now — zod decides, not a tolerant hash. See
+                        // lib/backfill.js.
+                        const plan = planFromPriors(schema, await readPriorAnswers(entity, identity, source))
+                        if (plan?.reuse) {
+                            meta = { ...meta, ...plan.reuse }
+                            produced = { ...(produced ?? {}), ...plan.reuse }
+                            // Filed under the new schema so the next build is
+                            // a direct hit rather than this search again.
+                            await writeLedger(entity, identity, source, plan.reuse, options.keep)
+                            logger.debug(
+                                'ocr: %s %s — the schema changed but the stored answer still satisfies it (no model call)',
+                                entity.id, label)
+                            continue
+                        }
+                        if (plan?.backfill) {
+                            asking = plan.backfill
+                            basis = plan.prior
+                            reportSchemaChange(logger, label, pending.size, plan.fields)
+                            logger.debug('ocr: %s %s — asking only for %j', entity.id, label, plan.fields)
                         }
                     }
 
@@ -292,7 +343,7 @@ export function ocr(options = {}) {
                         call: async () => {
                             const { object } = await generateObject({
                                 model:       options.model,
-                                schema:      buildEnvelope(schema),
+                                schema:      buildEnvelope(asking),
                                 messages,
                                 abortSignal: signal,
                                 ...(options.generateObjectOptions ?? {}),
@@ -302,9 +353,30 @@ export function ocr(options = {}) {
                     })
 
                     if (result.ok) {
-                        meta = { ...meta, ...result.data }
-                        produced = { ...(produced ?? {}), ...result.data }
-                        if (caching) await writeLedger(entity, identity, source, result.data, options.keep)
+                        // A backfill's answer is only the missing fields, so
+                        // it is merged onto the generation it was built from —
+                        // and the merge is validated against the FULL schema
+                        // before it is stored, so a partial ask can never file
+                        // a row that does not answer the question it is filed
+                        // under. If it does not validate, the row is left
+                        // unwritten and the next cycle does the whole
+                        // extraction rather than trusting a half-answer.
+                        let answer = result.data
+                        if (basis) {
+                            const merged = { ...basis, ...result.data }
+                            if (satisfies(schema, merged)) {
+                                answer = merged
+                            } else {
+                                logger.warn(
+                                    'ocr: %s %s — backfilling %j did not produce a complete answer; '
+                                    + 'the full extraction will run next cycle',
+                                    entity.id, label, Object.keys(result.data))
+                                break
+                            }
+                        }
+                        meta = { ...meta, ...answer }
+                        produced = { ...(produced ?? {}), ...answer }
+                        if (caching) await writeLedger(entity, identity, source, answer, options.keep)
                         logger.info('ocr: extracted %s (%s)%s', entity.id, label,
                             result.attempts > 1 ? ` after ${result.attempts} attempts` : '')
                     } else if (result.aborted) {

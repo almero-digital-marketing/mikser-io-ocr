@@ -23,7 +23,7 @@ import knexFactory from 'knex'
 import { z } from 'zod'
 import runtime from 'mikser-io/src/runtime.js'
 
-import { sourceFingerprint, questionFingerprint, readLedger, writeLedger, migrations } from '../lib/ledger.js'
+import { sourceFingerprint, questionFingerprint, readLedger, writeLedger, readPriorAnswers, migrations } from '../lib/ledger.js'
 
 const SCHEMA = z.object({ patient: z.string(), findings: z.array(z.string()) })
 const OTHER_SCHEMA = z.object({ patient: z.string(), findings: z.array(z.string()), grade: z.number() })
@@ -261,6 +261,98 @@ describe('one document, several questions', () => {
         await writeLedger(entity, ask({ step: 'notes' }), source, { notes: [] })
         assert.deepEqual(await readLedger(entity, ask(), source), RESULT)
         assert.deepEqual(await readLedger(entity, ask({ step: 'notes' }), source), { notes: [] })
+    })
+})
+
+describe('a schema edit, against the real ledger', () => {
+    it('finds the previous generation of the same question', async () => {
+        // The lookup the reuse and backfill paths are built on: same
+        // document, same step, same model, same prompt, DIFFERENT schema.
+        const source = await sourceFingerprint(entity)
+        const before = questionFingerprint({ schema: SCHEMA, model: MODEL, prompt: 'extract', step: 'report' })
+        await writeLedger(entity, before, source, RESULT)
+
+        const after = questionFingerprint({
+            schema: z.object({ patient: z.string(), findings: z.array(z.string()), uv: z.number().nullable() }),
+            model: MODEL, prompt: 'extract', step: 'report',
+        })
+        assert.equal(await readLedger(entity, after, source), null, 'precondition: the new schema misses')
+        assert.deepEqual(await readPriorAnswers(entity, after, source), [RESULT],
+            'but the previous generation is findable')
+    })
+
+    it('does not reach across a prompt change', async () => {
+        // A prompt is free text and its effect is unbounded: "measurements in
+        // mm" to "in cm" is the same schema and a different answer. A schema
+        // can be checked against a stored answer; guidance cannot.
+        const source = await sourceFingerprint(entity)
+        await writeLedger(entity, ask({ step: 'report', prompt: 'in mm' }), source, RESULT)
+        const other = questionFingerprint({
+            schema: z.object({ patient: z.string() }), model: MODEL, prompt: 'in cm', step: 'report',
+        })
+        assert.deepEqual(await readPriorAnswers(entity, other, source), [],
+            'a different prompt is a different question, not an older generation of this one')
+    })
+
+    it('does not reach across a model change', async () => {
+        const source = await sourceFingerprint(entity)
+        await writeLedger(entity, ask({ step: 'report' }), source, RESULT)
+        const other = questionFingerprint({
+            schema: z.object({ patient: z.string() }),
+            model: { provider: 'openai', modelId: 'gpt-4o' }, prompt: 'extract', step: 'report',
+        })
+        assert.deepEqual(await readPriorAnswers(entity, other, source), [])
+    })
+
+    it('does not reach across a changed document', async () => {
+        // The source version is still absolute: a different PDF's answer is
+        // not an older generation, it is a different document.
+        await writeLedger(entity, ask({ step: 'report' }), 'sum:v1', RESULT)
+        const after = questionFingerprint({
+            schema: z.object({ patient: z.string() }), model: MODEL, prompt: 'extract', step: 'report',
+        })
+        assert.deepEqual(await readPriorAnswers(entity, after, 'sum:v2'), [])
+    })
+
+    it('returns generations newest first', async () => {
+        const source = await sourceFingerprint(entity)
+        for (const [i, schema] of [
+            z.object({ a: z.string() }),
+            z.object({ b: z.string() }),
+            z.object({ c: z.string() }),
+        ].entries()) {
+            await writeLedger(entity,
+                questionFingerprint({ schema, model: MODEL, prompt: 'extract', step: 'report' }),
+                source, { generation: i })
+            await new Promise(r => setTimeout(r, 2))
+        }
+        const current = questionFingerprint({
+            schema: z.object({ d: z.string() }), model: MODEL, prompt: 'extract', step: 'report',
+        })
+        const priors = await readPriorAnswers(entity, current, source)
+        assert.deepEqual(priors.map(p => p.generation), [2, 1, 0],
+            'the most recent answer is the best candidate for reuse')
+    })
+})
+
+describe('an explicit `key` instead of the prompt', () => {
+    it('keeps the row when the prompt is reworded but the key is unchanged', async () => {
+        // What the lever is for: the author says the edit was cosmetic.
+        const source = await sourceFingerprint(entity)
+        const before = questionFingerprint({ schema: SCHEMA, model: MODEL, prompt: 'notes-v1', step: 'notes' })
+        await writeLedger(entity, before, source, RESULT)
+        const after = questionFingerprint({ schema: SCHEMA, model: MODEL, prompt: 'notes-v1', step: 'notes' })
+        assert.deepEqual(await readLedger(entity, after, source), RESULT)
+    })
+
+    it('invalidates when the key is bumped', async () => {
+        const source = await sourceFingerprint(entity)
+        await writeLedger(entity,
+            questionFingerprint({ schema: SCHEMA, model: MODEL, prompt: 'notes-v1', step: 'notes' }),
+            source, RESULT)
+        const bumped = questionFingerprint({ schema: SCHEMA, model: MODEL, prompt: 'notes-v2', step: 'notes' })
+        assert.equal(await readLedger(entity, bumped, source), null,
+            'bumping the key is how the author says the question changed')
     })
 })
 

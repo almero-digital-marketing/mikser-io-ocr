@@ -220,6 +220,53 @@ run B, compare, keep the better — and going back to A costs nothing, because
 A's answers were never overwritten. `keep` (default 5) bounds how many
 answers one document accumulates, dropping the oldest first.
 
+### An additive schema edit does not re-read the document
+
+`schema_hash` is over the whole schema, so any edit misses every stored row.
+That used to mean a full re-read: one field added to a forty-field schema over
+8-page PDFs re-read twelve documents in 4m44s, to obtain one number each — and
+about six and a half hours at a thousand documents.
+
+It is not fixed by hashing the schema more loosely. Hashing "the part that
+constrains the answer" would make an optional addition match the old row and
+hand back the old answer, leaving the new field absent forever with nothing
+saying so — a bill traded for silent incompleteness.
+
+So zod decides. On a schema miss, the answers stored under previous versions
+of the same question are validated against the schema **as it is now**:
+
+- **It still validates** → reuse it, with no model call at all. This is every
+  `.optional()` addition, which is most schema edits. The answer is re-filed
+  under the new schema so the next build is a direct hit.
+- **It does not** → something really is missing, so the model is asked for
+  **only the missing fields** (`schema.pick(...)`), and the answer is merged
+  onto the stored one. For a `source: false` step that is nearly free; for one
+  that sends a document it still sends it, but asks for one field of forty.
+
+The merge is validated against the full schema before it is stored, so a
+partial ask can never file a row that does not answer the question it is filed
+under. If the merge does not validate, nothing is written and the next cycle
+does the whole extraction.
+
+A narrowed type, a changed refinement, or a field whose stored value no longer
+parses is **not** an additive edit and is re-asked. So is anything under a
+different model or a different document version.
+
+**A prompt change still invalidates.** A prompt is free text and its effect is
+unbounded — "measurements in mm" to "in cm" is the same schema and a different
+answer — so a stored answer cannot be checked against it the way it can
+against a schema. Give a step an explicit `key` when you want to control that
+yourself: it replaces the prompt in the cache identity, so you can reword
+guidance freely and bump `key` when an edit actually changes the question.
+
+The first document that needs asking says so once per step, with a count:
+
+```
+ocr: the schema for /skincheck/**#report changed — up to 12 document(s) will be
+asked again, for ["uvSensitivity"]. Fields the stored answers already satisfy
+are not re-read.
+```
+
 A stored result is used only when **all** of these still match:
 
 | What | Why |
