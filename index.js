@@ -54,6 +54,23 @@ export const DEFAULT_CONCURRENCY = 4
 // setting falls back to the default rather than stopping the build — the
 // worst outcome of getting this wrong is a slower or faster pass, never a
 // wrong one, so refusing to run would be the larger harm.
+// Add one journal entry's entity to the work set, if a pattern claims it.
+//
+// Keyed by ID, because one file can arrive as several journal entries: a
+// WebDAV client writes a 4 MB PDF in chunks and every write is a change
+// event, so one upload came through as four CREATE rows. Walking rows meant
+// four extractions of the same document, started at once under concurrency,
+// all before any could write the ledger row that would have stopped the
+// others — four full reads, all billed, all but one discarded.
+//
+// Last entry wins: later rows carry later state, and it is the same file.
+export function addPending(pending, entity, match) {
+    if (!entity?.id) return pending
+    const hit = pickMatch(entity, match)
+    if (hit) pending.set(entity.id, { id: entity.id, entity, hit })
+    return pending
+}
+
 export function resolveConcurrency(value) {
     if (value === undefined || value === null) return DEFAULT_CONCURRENCY
     const n = Math.trunc(Number(value))
@@ -118,24 +135,33 @@ export function ocr(options = {}) {
             // write back), do the expensive work concurrently OFF the
             // journal, then walk it again and apply each answer inside the
             // body, where the write-back can see it.
-            const pending = []
+            // A MAP, keyed by id, because one file can be several journal
+            // entries. A WebDAV upload writes in chunks and each write is a
+            // change event, so one 4 MB PDF arrived as four CREATE rows —
+            // and with concurrency on, all four were extracted at once, in
+            // parallel, before any of them could write the ledger row that
+            // would have stopped the others. Four full reads of the same
+            // document, all billed, all but one thrown away.
+            //
+            // Last entry wins: later rows carry later state, and the entity
+            // is the same file either way.
+            const pending = new Map()
             for await (const { entity } of useJournal(
                 'OCR scan',
                 [OPERATION.CREATE, OPERATION.UPDATE],
                 signal,
             )) {
                 if (signal.aborted) return
-                const hit = pickMatch(entity, options.match)
-                if (hit) pending.push({ id: entity.id, entity, hit })
+                addPending(pending, entity, options.match)
             }
-            if (!pending.length) return
+            if (!pending.size) return
 
             // id → the meta to merge. Keyed by id because pass three
             // deserializes its own entity objects from the journal rows;
             // the ones gathered above are copies.
             const extracted = new Map()
 
-            await pMap(pending, async ({ entity, hit }) => {
+            await pMap(pending.values(), async ({ entity, hit }) => {
                 if (signal.aborted) return
 
                 // A match is a SEQUENCE of questions — see lib/steps.js.
@@ -258,6 +284,7 @@ export function ocr(options = {}) {
                         retries: options.retries ?? DEFAULT_RETRIES,
                         signal,
                         onRetry: ({ attempt, reason, threw }) => {
+                            if (signal.aborted) return   // a restart is not a flaky provider
                             logger.warn('ocr: %s %s attempt %d failed (%s), retrying: %s',
                                 entity.id, label, attempt,
                                 threw ? 'provider error' : 'model reported failure', reason)
@@ -280,6 +307,14 @@ export function ocr(options = {}) {
                         if (caching) await writeLedger(entity, identity, source, result.data, options.keep)
                         logger.info('ocr: extracted %s (%s)%s', entity.id, label,
                             result.attempts > 1 ? ` after ${result.attempts} attempts` : '')
+                    } else if (result.aborted) {
+                        // Not a failure of the document or the model: the
+                        // cycle was restarted under it. The engine carries
+                        // the journal entry into the next cycle, so this is
+                        // picked up rather than lost.
+                        logger.debug('ocr: %s %s cancelled mid-flight — the next cycle will pick it up',
+                            entity.id, label)
+                        break
                     } else if (result.threw) {
                         logger.error('ocr: %s %s — generateObject failed after %d attempt(s): %s',
                             entity.id, label, result.attempts, result.reason)

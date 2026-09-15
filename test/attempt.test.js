@@ -94,6 +94,51 @@ describe('an envelope reporting failure', () => {
     })
 })
 
+describe('a cancelled cycle', () => {
+    it('is not reported as the model refusing the document', async () => {
+        // It was, and it cost the reporter their first pass: four lines of
+        // "model could not extract" sent them looking for a bad PDF when the
+        // model had never been asked anything.
+        const controller = new AbortController()
+        controller.abort()
+        const out = await extractWithRetry({
+            call: async () => ({ ok: true, data: {} }),
+            signal: controller.signal, sleep: nap,
+        })
+        assert.equal(out.ok, false)
+        assert.equal(out.aborted, true, 'an abort must be distinguishable from an answer')
+        assert.equal(out.threw, false, 'and from a provider fault')
+        assert.match(out.reason, /cancelled/)
+    })
+
+    it('reports an abort that arrives as a thrown provider error, without retrying it', async () => {
+        // What actually happens in flight: the AbortSignal fires and the
+        // provider call rejects with "This operation was aborted". Retrying
+        // that is pure noise, and it is what the reporter saw — four
+        // "attempt 1 failed, retrying: This operation was aborted" lines for
+        // a cycle that had already been restarted.
+        const controller = new AbortController()
+        const retries = []
+        let slept = 0
+        let calls = 0
+        const out = await extractWithRetry({
+            call: async () => {
+                calls++
+                controller.abort()
+                throw new Error('This operation was aborted')
+            },
+            signal: controller.signal, retries: 3,
+            sleep: async () => { slept++ },
+            onRetry: (info) => retries.push(info),
+        })
+        assert.equal(out.aborted, true)
+        assert.equal(out.threw, false, 'a restart is not a provider fault')
+        assert.equal(calls, 1, 'a cancelled cycle must not pay the provider again')
+        assert.deepEqual(retries, [], 'and must not log a retry it is not going to make')
+        assert.equal(slept, 0, 'nor back off before giving up')
+    })
+})
+
 describe('the retry mechanics', () => {
     it('does not call again once the signal is aborted', async () => {
         let calls = 0
