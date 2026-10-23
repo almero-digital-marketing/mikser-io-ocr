@@ -15,7 +15,7 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { z } from 'zod'
 
-import { normalizeSteps, resolvePrompt, cacheKeyFor, LEGACY_STEP } from '../lib/steps.js'
+import { normalizeSteps, resolvePrompt, cacheKeyFor, resolveAttachments, LEGACY_STEP } from '../lib/steps.js'
 
 const A = z.object({ a: z.string() })
 const B = z.object({ b: z.string() })
@@ -132,5 +132,46 @@ describe('resolvePrompt', () => {
 
     it('stringifies a non-string return rather than passing an object on', () => {
         assert.equal(resolvePrompt({ prompt: () => 42 }, entity).prompt, '42')
+    })
+})
+
+// A question about more than the entity's own source: photographs beside a
+// database record, crops of them. Reported from a skin-check pipeline that
+// reads acne scars off the side-view photos of a scan whose source is JSON.
+describe('attachments', () => {
+    const JPEG = Buffer.from('ffd8ffe000104a464946', 'hex')
+    const entity = { id: '/r.json', meta: { photos: ['a', 'b'] } }
+
+    it('carries `attach` through normalization, and refuses one that is not a function', () => {
+        const attach = () => []
+        const [step] = normalizeSteps([{ name: 'scars', schema: A, attach }])
+        assert.equal(step.attach, attach)
+        assert.throws(() => normalizeSteps([{ name: 'scars', schema: A, attach: 'photos/*.jpg' }],
+            { patternForError: '/x/**' }), /`attach` that is not a function/)
+    })
+
+    it('is absent unless asked for, and then attaches nothing', async () => {
+        const [step] = normalizeSteps([{ name: 'n', schema: A }])
+        assert.equal(step.attach, undefined)
+        assert.deepEqual(await resolveAttachments(step, entity), { attachments: [] })
+    })
+
+    it('derives the files from the entity, awaiting an async attach', async () => {
+        const step = { attach: async (e) => e.meta.photos.map((name) => ({ data: JPEG, mediaType: 'image/jpeg', filename: name })) }
+        const out = await resolveAttachments(step, entity)
+        assert.deepEqual(out.attachments.map((f) => f.filename), ['a', 'b'])
+    })
+
+    it('skips quietly when the files are not ready', async () => {
+        const out = await resolveAttachments({ attach: () => null }, entity)
+        assert.match(out.skip, /not ready/)
+        assert.equal(out.failed, undefined, 'waiting is not a failure')
+    })
+
+    it('reports a throw, and a malformed file, without killing the build', async () => {
+        assert.ok((await resolveAttachments({ attach: () => { throw new Error('no frame') } }, entity)).failed)
+        assert.match((await resolveAttachments({ attach: () => 'not an array' }, entity)).failed, /array/)
+        assert.match((await resolveAttachments({ attach: () => [{ data: JPEG }] }, entity)).failed, /mediaType/)
+        assert.match((await resolveAttachments({ attach: () => [{ data: 'path.jpg', mediaType: 'image/jpeg' }] }, entity)).failed, /bytes/)
     })
 })

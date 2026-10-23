@@ -131,3 +131,41 @@ describe('the binary path builds a part the AI SDK accepts', () => {
         })
     })
 })
+
+describe('a step\'s attachments', () => {
+    const JPEG = Buffer.from('ffd8ffe000104a464946', 'hex')
+    const files = [
+        { data: JPEG, mediaType: 'image/jpeg', filename: 'left.jpg' },
+        { data: JPEG, mediaType: 'image/jpeg', filename: 'right.jpg' },
+    ]
+
+    it('follow a prompt-only question, in order, as file parts', async () => {
+        const messages = await buildMessages({ entity: { id: '/r.json' }, contentResult: null, prompt: 'scars?', attachments: files })
+        assert.equal(messages.length, 1)
+        const [text, ...rest] = messages[0].content
+        assert.equal(text.type, 'text')
+        assert.deepEqual(rest.map((p) => [p.type, p.mediaType, p.filename]),
+            [['file', 'image/jpeg', 'left.jpg'], ['file', 'image/jpeg', 'right.jpg']])
+    })
+
+    it('come after the source when the source is sent too', async () => {
+        await withCached('report.pdf', PDF, async (cachedAt) => {
+            const messages = await buildMessages({ entity: { id: '/files/report.pdf' }, contentResult: { cachedAt }, attachments: files })
+            const parts = messages[0].content
+            assert.equal(parts[1].mediaType, 'application/pdf', 'the source keeps its place after the prompt')
+            assert.deepEqual(parts.slice(2).map((p) => p.filename), ['left.jpg', 'right.jpg'])
+        })
+    })
+
+    it('reach the model through the SDK', async () => {
+        const messages = await buildMessages({ entity: { id: '/r.json' }, contentResult: null, prompt: 'scars?', attachments: files.slice(0, 1) })
+        const part = await throughTheSdk(messages)
+        assert.ok(part, 'the attachment never reached the model')
+        assert.equal(part.mediaType, 'image/jpeg')
+    })
+
+    it('change nothing when there are none', async () => {
+        const messages = await buildMessages({ entity: { id: '/r.json' }, contentResult: null, prompt: 'p' })
+        assert.deepEqual(messages, [{ role: 'user', content: [{ type: 'text', text: 'p' }] }])
+    })
+})

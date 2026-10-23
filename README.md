@@ -317,6 +317,28 @@ entities, which is where the independence actually is.
   reordering the array must not discard paid-for answers. An unnamed step in
   a sequence is refused rather than guessed at.
 
+- **`attach`** sends files beside the question, for a question about more than
+  the entity's own source: the photographs next to a database record, crops of
+  them, a second document. It is a function of the entity (it may be async)
+  returning `[{ data, mediaType, filename? }]`, each sent as a file part after
+  the prompt, and after the source when that is sent too:
+
+  ```js
+  { name: 'scars', schema: scarReading, source: false,
+    prompt: (entity) => scarQuestion(entity),         // names what is attached
+    attach: async (entity) => cheekCrops(entity) }    // [{ data, mediaType: 'image/jpeg' }]
+  ```
+
+  It runs only when the ledger has no answer, so reading and cropping the files
+  costs nothing on a warm build. That also means the files are **not** part of
+  the cache key: the answer is filed under the question and the entity's source
+  like any other. If the attachments can change while both stay the same, say
+  so in the prompt and the changed prompt re-asks. The prompt is resolved on
+  every build, so identify them cheaply: names, sizes and mtimes, not a hash of
+  the bytes. Returning `null` skips the step until the next cycle, as a
+  prompt can; a throw, or a file without bytes and a `mediaType`, is reported
+  and the step is skipped.
+
 **Steps that are not model calls stay in your pipeline.** This does not try
 to absorb ordinary code. If deriving findings from measurements is code —
 and it should be, if asking the model gave five findings one run and two the

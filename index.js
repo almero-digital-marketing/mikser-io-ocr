@@ -26,7 +26,7 @@ import pMap from 'p-map'
 import { generateObject } from 'ai'
 import { readEntityContent, useService } from 'mikser-io'
 import { pickMatch, resolveSchema } from './lib/resolve.js'
-import { normalizeSteps, resolvePrompt, cacheKeyFor } from './lib/steps.js'
+import { normalizeSteps, resolvePrompt, cacheKeyFor, resolveAttachments } from './lib/steps.js'
 import { planFromPriors, satisfies } from './lib/backfill.js'
 import { buildMessages } from './lib/messages.js'
 import { resolveContent } from './lib/content.js'
@@ -313,11 +313,25 @@ export function ocr(options = {}) {
                         }
                     }
 
+                    // The step's own files, prepared only now — past the
+                    // ledger, so a warm build never reads or crops them.
+                    const attached = await resolveAttachments(step, view)
+                    if (attached.skip) {
+                        logger.debug('ocr: %s skipping %s — %s', entity.id, label, attached.skip)
+                        continue
+                    }
+                    if (attached.failed) {
+                        logger.warn('ocr: %s could not attach the files for %s: %s',
+                            entity.id, label, attached.failed)
+                        continue
+                    }
+
                     const messages = await buildMessages({
                         entity: view,
                         contentResult: step.source ? resolved : null,
                         prompt: asked.prompt,
                         extraInstruction: FAILURE_INSTRUCTION,
+                        attachments: attached.attachments,
                     })
                     if (!messages) {
                         logger.warn('ocr: %s matched %j but built no message — please report this.',
