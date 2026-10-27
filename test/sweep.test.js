@@ -67,12 +67,22 @@ describe('unansweredStep', () => {
         assert.equal(await unansweredStep(entity, hitFor(visual), { options }), null)
     })
 
-    it('still asks when the ledger answer is for an older version of the file', async () => {
+    it('still asks a step that reads the file when the ledger answer is for an older version of it', async () => {
+        const reads = [{ name: 'visual', schema: VISUAL, prompt: 'look' }]
         const entity = report()
         const identity = questionFingerprint({ schema: VISUAL, model: MODEL, prompt: 'look', step: 'visual' })
         await writeLedger(entity, identity, 'sum:c1', { visualCheck: { acne: 'mild' } })
         const edited = report({}, { checksum: 'c2' })
-        assert.equal(await unansweredStep(edited, hitFor(visual), { options }), `${PATTERN}#visual`)
+        assert.equal(await unansweredStep(edited, hitFor(reads), { options }), `${PATTERN}#visual`)
+    })
+
+    it('does not ask a step sent only its prompt because the file changed', async () => {
+        // The same question has the same answer, whatever the file's bytes.
+        const entity = report()
+        const identity = questionFingerprint({ schema: VISUAL, model: MODEL, prompt: 'look', step: 'visual' })
+        await writeLedger(entity, identity, 'sum:c1', { visualCheck: { acne: 'mild' } })
+        const edited = report({}, { checksum: 'c2' })
+        assert.equal(await unansweredStep(edited, hitFor(visual), { options }), null)
     })
 
     it('is null for a step whose prompt says it is not ready', async () => {

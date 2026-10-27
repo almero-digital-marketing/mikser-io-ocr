@@ -37,7 +37,7 @@ import { normalizeSteps, resolvePrompt, cacheKeyFor, resolveAttachments } from '
 import { planFromPriors, satisfies } from './lib/backfill.js'
 import { buildMessages } from './lib/messages.js'
 import { resolveContent } from './lib/content.js'
-import { sourceFingerprint, questionFingerprint, readLedger, writeLedger, readPriorAnswers } from './lib/ledger.js'
+import { sourceFingerprint, sourceFor, questionFingerprint, readLedger, writeLedger, readPriorAnswers } from './lib/ledger.js'
 import { extractWithRetry, DEFAULT_RETRIES } from './lib/attempt.js'
 import {
     resolveRequeue, matchKey, readRequeue, isDue, nextRetryAt, recordRetry, recordDeclined,
@@ -482,7 +482,9 @@ export function ocr(options = {}) {
                             prompt: cacheKeyFor(step, asked.prompt),
                             step: step.name })
                         : null
-                    const source = caching ? await sourceFingerprint(entity) : null
+                    // The document's version, or the question alone for a
+                    // step whose answer cannot change with it.
+                    const source = caching ? sourceFor(step, await fingerprint()) : null
                     // What the model will actually be asked, if anything. A
                     // full schema by default; a backfill narrows it to the
                     // fields a previous generation's answer does not already

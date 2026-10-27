@@ -23,7 +23,9 @@ import knexFactory from 'knex'
 import { z } from 'zod'
 import runtime from 'mikser-io/src/runtime.js'
 
-import { sourceFingerprint, questionFingerprint, readLedger, writeLedger, readPriorAnswers, migrations } from '../lib/ledger.js'
+import {
+    sourceFingerprint, sourceFor, questionFingerprint, readLedger, writeLedger, readPriorAnswers, migrations, QUESTION_ONLY,
+} from '../lib/ledger.js'
 
 const SCHEMA = z.object({ patient: z.string(), findings: z.array(z.string()) })
 const OTHER_SCHEMA = z.object({ patient: z.string(), findings: z.array(z.string()), grade: z.number() })
@@ -385,5 +387,58 @@ describe('what counts as the same document', () => {
 
     it('does not treat a missing file as a stable identity', async () => {
         assert.equal(await sourceFingerprint({ id: '/x', uri: '/nonexistent/gone.pdf' }), null)
+    })
+})
+
+describe('a step asked only its prompt', () => {
+    // `source: false` and nothing that hides what the answer depends on — the
+    // prompt alone identifies it, so the document's version is not compared.
+    const questionOnly = { sourceInKey: false }
+    const notes = () => ask({ step: 'notes' })
+
+    it('files the answer under the question alone', async () => {
+        assert.equal(sourceFor(questionOnly, 'sum:abc123'), QUESTION_ONLY)
+        assert.equal(sourceFor({ sourceInKey: true }, 'sum:abc123'), 'sum:abc123')
+        // Nothing to identify the document by is no reason not to cache an
+        // answer that never depended on it.
+        assert.equal(sourceFor(questionOnly, null), QUESTION_ONLY)
+        assert.equal(sourceFor({ sourceInKey: true }, null), null)
+    })
+
+    it('still finds the answer after the file changed', async () => {
+        await writeLedger(entity, notes(), sourceFor(questionOnly, 'sum:v1'), RESULT)
+        const resent = { ...entity, checksum: 'v2' }
+        assert.deepEqual(
+            await readLedger(resent, notes(), sourceFor(questionOnly, await sourceFingerprint(resent))), RESULT)
+    })
+
+    it('still asks again when the question changed', async () => {
+        await writeLedger(entity, notes(), QUESTION_ONLY, RESULT)
+        assert.equal(await readLedger(entity, ask({ step: 'notes', prompt: 'other measures' }), QUESTION_ONLY), null)
+    })
+
+    it('finds an answer filed against a version of the document, and re-files it', async () => {
+        // Every row written up to 11.9.0 is one of these. Refusing them would
+        // make the upgrade itself the re-ask the marker exists to avoid.
+        await writeLedger(entity, notes(), 'sum:written-by-11.9.0', RESULT)
+        assert.deepEqual(await readLedger(entity, notes(), QUESTION_ONLY), RESULT)
+        const [row] = await knex('mikser_ocr_extractions').where({ id: entity.id, step: 'notes' })
+        assert.equal(row.source, QUESTION_ONLY)
+        assert.equal(JSON.parse(row.result).patient, RESULT.patient, 'the answer itself is untouched')
+    })
+
+    it('is not found by a step that reads the document', async () => {
+        // The other direction stays strict: an answer filed without a version
+        // says nothing about the bytes a reading step is asked about.
+        await writeLedger(entity, notes(), QUESTION_ONLY, RESULT)
+        assert.equal(await readLedger(entity, notes(), 'sum:abc123'), null)
+    })
+
+    it('reaches previous generations filed against any version', async () => {
+        const before = questionFingerprint({ schema: z.object({ patient: z.string() }), model: MODEL, prompt: 'extract', step: 'notes' })
+        await writeLedger(entity, before, 'sum:v1', { patient: 'A. Ivanova' })
+        assert.deepEqual(await readPriorAnswers(entity, notes(), QUESTION_ONLY), [{ patient: 'A. Ivanova' }])
+        assert.deepEqual(await readPriorAnswers(entity, notes(), 'sum:v2'), [],
+            'a reading step still needs the same version')
     })
 })

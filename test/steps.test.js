@@ -175,3 +175,50 @@ describe('attachments', () => {
         assert.match((await resolveAttachments({ attach: () => [{ data: 'path.jpg', mediaType: 'image/jpeg' }] }, entity)).failed, /bytes/)
     })
 })
+
+describe('whether the document is in the key', () => {
+    // A `source: false` step is sent its prompt and nothing else, so the
+    // file's bytes were only ever in its key by accident — and the accident
+    // was about to re-ask three questions about 260 reports because the
+    // clinic boxes re-sent every JSON with one more block nobody reads.
+    const step = (over) => normalizeSteps([{ name: 'n', schema: A, ...over }], { patternForError: '/x/**' })[0]
+
+    it('keeps it for every step that reads the document', () => {
+        for (const spec of ['janus-report', A, { schema: A, prompt: 'p' }]) {
+            assert.equal(normalizeSteps(spec)[0].sourceInKey, true)
+        }
+        assert.equal(step({}).sourceInKey, true)
+    })
+
+    it('drops it for a step asked only its prompt', () => {
+        assert.equal(step({ source: false, prompt: 'p' }).sourceInKey, false)
+    })
+
+    it('keeps it when a `key` stands in for the prompt', () => {
+        // The prompt built from the file's data no longer moves the
+        // identity; the file is what still does.
+        assert.equal(step({ source: false, key: 'v1' }).sourceInKey, true)
+    })
+
+    it('keeps it when files are attached', () => {
+        // They are not in the key, and they may be chosen from the file.
+        assert.equal(step({ source: false, attach: () => [] }).sourceInKey, true)
+    })
+
+    it('drops it when the author says the prompt identifies everything', () => {
+        assert.equal(step({ source: false, attach: () => [], sourceInKey: false }).sourceInKey, false)
+        assert.equal(step({ source: false, key: 'v1', sourceInKey: false }).sourceInKey, false)
+    })
+
+    it('keeps it when the author asks to, on a step that would drop it', () => {
+        assert.equal(step({ source: false, sourceInKey: true }).sourceInKey, true)
+    })
+
+    it('refuses to drop it from a step that reads the document', () => {
+        assert.throws(() => step({ sourceInKey: false }), /sends the document/)
+    })
+
+    it('refuses a value that is not true or false', () => {
+        assert.throws(() => step({ source: false, sourceInKey: 'no' }), /not true or false/)
+    })
+})

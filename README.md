@@ -271,7 +271,7 @@ A stored result is used only when **all** of these still match:
 
 | What | Why |
 | --- | --- |
-| the document's content | `entity.checksum` — the hash mikser's import gate already computed, so this is exact and costs no extra read. Falls back to size + mtime when an entity arrives without one, and caches nothing at all when it can identify neither. |
+| the document's content | `entity.checksum` — the hash mikser's import gate already computed, so this is exact and costs no extra read. Falls back to size + mtime when an entity arrives without one, and caches nothing at all when it can identify neither. **Not compared for a step that never sees the document** — see `source: false` below. |
 | the schema | A different shape is a different question. |
 | the model and provider | `openai:gpt-4o-mini` → `openai:gpt-4o` re-reads. |
 | the effective prompt | Invisible from the source file, and it changes the answer. |
@@ -312,6 +312,27 @@ entities, which is where the independence actually is.
   about the document. Re-attaching a 4 MB PDF to ask about a hundred bytes of
   JSON already in hand pays for the whole thing twice.
 
+  Such a step is sent its prompt and nothing else, so its answer is filed
+  under **the question alone**, not under the version of the document: an
+  edit to the file that does not change what the prompt asks about does not
+  ask it again. A prompt built from meta changes when anything it asks about
+  changes, and that is what re-asks. Answers filed against the file by earlier
+  releases are found the same way, and re-filed.
+
+  Two things keep the document in the key, because then the prompt text no
+  longer shows everything the answer depends on:
+
+  - a **`key`**, which stands in for the prompt — a prompt built from the
+    file's data no longer moves the identity, so the file has to;
+  - **`attach`**, whose files are not in the key and may be chosen from what
+    the file says.
+
+  Set **`sourceInKey: false`** on such a step when its prompt (or key) does
+  identify everything — the crops a question attaches, named by size in the
+  prompt. `sourceInKey: true` keeps the document in the key of any step.
+  `sourceInKey: false` on a step that reads the document is refused: its answer
+  was read from those bytes.
+
 - **`name` is the identity**, and is required in a sequence. It goes into the
   ledger key, so steps are numbered by name rather than by position —
   reordering the array must not discard paid-for answers. An unnamed step in
@@ -333,7 +354,9 @@ entities, which is where the independence actually is.
   costs nothing on a warm build. That also means the files are **not** part of
   the cache key: the answer is filed under the question and the entity's source
   like any other. If the attachments can change while both stay the same, say
-  so in the prompt and the changed prompt re-asks. The prompt is resolved on
+  so in the prompt and the changed prompt re-asks — and then `sourceInKey:
+  false` lets an edit to the entity's own file that the prompt does not see
+  leave the answer alone. The prompt is resolved on
   every build, so identify them cheaply: names, sizes and mtimes, not a hash of
   the bytes. Returning `null` skips the step until the next cycle, as a
   prompt can; a throw, or a file without bytes and a `mediaType`, is reported
