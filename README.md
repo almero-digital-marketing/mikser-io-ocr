@@ -259,6 +259,25 @@ against a schema. Give a step an explicit `key` when you want to control that
 yourself: it replaces the prompt in the cache identity, so you can reword
 guidance freely and bump `key` when an edit actually changes the question.
 
+`key` may also be a **function** `(entity, prompt) => string`, for a question
+built from meta whose answer should not follow all of it — notes asked with a
+client's whole readings table, keyed on the prompt without that table, are
+asked again when the recommendations change and not when a reading does:
+
+```js
+{ name: 'notes', schema: notes, source: false, sourceInKey: false,
+  prompt: (entity) => `${GUIDANCE}\n\nReadings:\n${table(entity)}\n\nCards:\n${cards(entity)}`,
+  key: (entity, prompt) => prompt.replace(/\n\nReadings:\n[\s\S]*?\n\nCards:\n/, '\n\nCards:\n') }
+```
+
+Returning nothing, or throwing, files the answer under the prompt as before.
+
+Giving a step a key is not a re-ask. While nothing is filed under the key
+yet, an answer filed under the exact prompt the step resolves to now — before
+it had a key, or before the key named questions this way — is this question's
+answer: it is used and filed under the key. A prompt that is itself new is
+asked.
+
 The first document that needs asking says so once per step, with a count:
 
 ```

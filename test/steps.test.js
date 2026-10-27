@@ -83,6 +83,15 @@ describe('the `key` lever', () => {
         const [noKey] = normalizeSteps([{ name: 'n', schema: A, prompt: 'v1 guidance' }])
         assert.equal(cacheKeyFor(noKey, 'v1 guidance'), 'v1 guidance')
         assert.equal(cacheKeyFor(noKey, 'reworded'), 'reworded', 'default stays prompt-sensitive')
+
+        // A function of the entity and the prompt; nothing back, or a throw,
+        // and the prompt is the question again.
+        const [derived] = normalizeSteps([{ name: 'n', schema: A, prompt: 'p', key: (entity, prompt) => `${entity.meta.cards}|${prompt.length}` }])
+        assert.equal(cacheKeyFor(derived, 'four', { meta: { cards: 'pores' } }), 'pores|4')
+        const [empty] = normalizeSteps([{ name: 'n', schema: A, prompt: 'p', key: () => null }])
+        assert.equal(cacheKeyFor(empty, 'the prompt', {}), 'the prompt')
+        const [broken] = normalizeSteps([{ name: 'n', schema: A, prompt: 'p', key: () => { throw new Error('x') } }])
+        assert.equal(cacheKeyFor(broken, 'the prompt', {}), 'the prompt')
     })
 
     it('is absent unless asked for, so the prompt stays the identity', () => {

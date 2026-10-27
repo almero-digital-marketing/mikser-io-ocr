@@ -37,7 +37,7 @@ import { normalizeSteps, resolvePrompt, cacheKeyFor, resolveAttachments } from '
 import { planFromPriors, satisfies } from './lib/backfill.js'
 import { buildMessages } from './lib/messages.js'
 import { resolveContent } from './lib/content.js'
-import { sourceFingerprint, sourceFor, questionFingerprint, readLedger, writeLedger, readPriorAnswers } from './lib/ledger.js'
+import { sourceFingerprint, sourceFor, questionFingerprint, recallAnswer, writeLedger, readPriorAnswers } from './lib/ledger.js'
 import { extractWithRetry, DEFAULT_RETRIES } from './lib/attempt.js'
 import {
     resolveRequeue, matchKey, readRequeue, isDue, nextRetryAt, recordRetry, recordDeclined,
@@ -479,8 +479,13 @@ export function ocr(options = {}) {
                             schema, model: options.model,
                             // `key` stands in for the prompt when the author
                             // declared one — see lib/steps.js.
-                            prompt: cacheKeyFor(step, asked.prompt),
+                            prompt: cacheKeyFor(step, asked.prompt, view),
                             step: step.name })
+                        : null
+                    // The question as the prompt alone names it: where an
+                    // answer filed before the step had its key is found.
+                    const asPrompt = caching && step.key !== undefined
+                        ? questionFingerprint({ schema, model: options.model, prompt: asked.prompt, step: step.name })
                         : null
                     // The document's version, or the question alone for a
                     // step whose answer cannot change with it.
@@ -492,7 +497,12 @@ export function ocr(options = {}) {
                     let asking = schema
                     let basis = null
                     if (caching) {
-                        const remembered = await readLedger(entity, identity, source)
+                        const { answer: remembered, adopted } = await recallAnswer(entity, identity, asPrompt, source)
+                        if (adopted) {
+                            filed = await writeLedger(entity, identity, source, remembered, options.keep) && filed
+                            logger.debug('ocr: %s %s filed under its key — answered under this very prompt before',
+                                entity.id, label)
+                        }
                         if (remembered) {
                             meta = { ...meta, ...remembered }
                             produced = { ...(produced ?? {}), ...remembered }
