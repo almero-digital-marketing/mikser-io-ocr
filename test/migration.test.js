@@ -74,6 +74,20 @@ describe('migrating a 11.3.0 ledger', () => {
             'the composite key must still be a key')
     })
 
+    it('adds the requeue beside the ledger without touching an answer', async () => {
+        // 004 is a new table, not a rebuild — but an install upgrading into it
+        // has a ledger full of paid-for answers, and that is what to prove.
+        const before = await knex(TABLE).orderBy(['id', 'prompt_hash'])
+        await migrations[3].up(knex)
+        assert.deepEqual(await knex(TABLE).orderBy(['id', 'prompt_hash']), before)
+
+        await knex('mikser_ocr_requeue').insert({
+            id: '/skincheck/8501054473.pdf', match_key: '/skincheck/**/*.pdf', kind: 'retry',
+            attempts: 1, updated_at: Date.now(), retry_at: Date.now() + 60_000,
+        })
+        assert.equal((await knex('mikser_ocr_requeue').select('*')).length, 1)
+    })
+
     it('runs on an empty ledger without complaint', async () => {
         const fresh = knexFactory({
             client: 'better-sqlite3',

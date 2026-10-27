@@ -16,12 +16,19 @@
 //      via AI SDK. Result is validated by the schema at the model layer.
 //   7. Merge into entity.meta. The journal auto-persists the mutation.
 //
+// A call that THREW is written down and asked again later, on its own, with
+// a growing delay (lib/requeue.js); the first pass after startup also looks
+// for matched documents with no answer at all (lib/sweep.js). Without either,
+// a document only came back when its file changed — see 27.10.2026 in
+// lib/requeue.js.
+//
 // What this plugin is NOT:
 //   - A pipeline abstraction over providers — that's AI SDK's job.
 //   - A schema registry — that's mikser-io-schemas.
 //   - A source plugin — entities arrive via documents / files / gdrive /
 //     wherever. ocr is purely a consumer.
 
+import path from 'node:path'
 import pMap from 'p-map'
 import { generateObject } from 'ai'
 import { readEntityContent, useService } from 'mikser-io'
@@ -32,6 +39,27 @@ import { buildMessages } from './lib/messages.js'
 import { resolveContent } from './lib/content.js'
 import { sourceFingerprint, questionFingerprint, readLedger, writeLedger, readPriorAnswers } from './lib/ledger.js'
 import { extractWithRetry, DEFAULT_RETRIES } from './lib/attempt.js'
+import {
+    resolveRequeue, matchKey, readRequeue, isDue, nextRetryAt, recordRetry, recordDeclined,
+    recordReimport, queueNow, clearRequeue, createBreaker, describeDelay, DECLINED, REIMPORT,
+} from './lib/requeue.js'
+import { unansweredStep, idRanges } from './lib/sweep.js'
+
+// The provider call, replaceable so a test can drive a whole pass — a
+// failure, the retry, the answer — without a provider. ai's own mock models
+// change shape between majors, and the suite runs against whichever major
+// npm resolves, so a test built on one would break on the next.
+let generate = generateObject
+export function __setGenerateObjectForTests(fn) {
+    generate = fn ?? generateObject
+}
+
+// setTimeout cannot wait longer than this; a later retry wakes early and
+// goes back to sleep.
+const LONGEST_TIMEOUT = 2_147_483_647
+
+// How often a due retry looks again while a cycle is still running.
+const CYCLE_POLL_MS = 1000
 
 // How many extractions run at once when nothing says otherwise.
 //
@@ -105,7 +133,8 @@ export const extract = (...args) => ocr(...args)
 
 export function ocr(options = {}) {
     return ({
-        runtime, useLogger, useJournal, onProcess,
+        runtime, useLogger, useJournal, onProcess, onProcessed,
+        findEntity, iterateEntities, updateEntity, updatedHook, triggeredHook,
         constants: { OPERATION },
     }) => {
         if (!options.model) {
@@ -123,6 +152,131 @@ export function ocr(options = {}) {
                 useLogger().warn('ocr: no `match` patterns configured — plugin is inert.')
             })
             return
+        }
+
+        // null when `requeue: false` — nothing recorded, nothing asked again.
+        const requeue = resolveRequeue(options.requeue)
+
+        // Pattern → the key this call's requeue rows are filed under. A
+        // pattern whose steps do not normalize has no key; the pass reports
+        // that for every entity it reaches.
+        const keyOf = new Map()
+        for (const [pattern, spec] of Object.entries(options.match)) {
+            try {
+                keyOf.set(pattern, matchKey(pattern, normalizeSteps(spec, { patternForError: pattern })))
+            } catch { /* reported per entity by the pass */ }
+        }
+        const keys = [...keyOf.values()]
+
+        // Answered on a later attempt, waiting for the cycle to end so their
+        // source can import them again. id → { collection, relativePath }.
+        const reimports = new Map()
+        let timer = null
+        let lastWake = 0
+        let swept = false
+
+        // Only a process that stays up has a "later" to ask in. A one-shot
+        // build exits after its cycle, and the next one's startup sweep is
+        // its retry.
+        const lasting = () => Boolean(runtime.options?.watch || runtime.options?.server)
+
+        async function arm() {
+            clearTimeout(timer)
+            timer = null
+            if (!requeue || !lasting()) return
+            if (reimports.size) return sleepUntil(Date.now())
+            const at = await nextRetryAt(keys)
+            // Never more than one cycle per `first` from here. A row the pass
+            // cannot move — a durable store that reads but will not write —
+            // stays due, and without a floor every cycle would start the next
+            // one the moment it ended.
+            if (at !== null) sleepUntil(Math.max(at, lastWake + requeue.first))
+        }
+
+        function sleepUntil(at) {
+            clearTimeout(timer)
+            timer = setTimeout(() => wake(at), Math.min(LONGEST_TIMEOUT, Math.max(0, at - Date.now())))
+            // A pending retry must not be what keeps a process alive.
+            timer.unref?.()
+        }
+
+        async function wake(at) {
+            timer = null
+            if (Date.now() < at) return sleepUntil(at)
+            // Never while a cycle is running. A trigger does not queue
+            // behind the cycle in flight: runtime.process() CANCELS it and
+            // starts again, which would abort extractions already being paid
+            // for, and a re-import journaled mid-cycle is half-applied and
+            // then cleared at finalize (mikser-io's manager.js, `deliver`).
+            // `processing` is true for the whole cycle, gaps between phases
+            // included — which is why this needs mikser-io 11.14.0.
+            if (runtime.processing) return sleepUntil(Date.now() + CYCLE_POLL_MS)
+            const logger = useLogger()
+            lastWake = Date.now()
+            try {
+                // The documents a retry answered go back through their
+                // source exactly as an edited file would, so every plugin
+                // after this one derives from the answer instead of from
+                // the page as it was rendered without it.
+                const waiting = [...reimports.values()]
+                reimports.clear()
+                for (const { collection, relativePath } of waiting) {
+                    await updatedHook(collection, { relativePath })
+                }
+                // And a cycle for the retries that are due. The engine
+                // debounces triggers, so this and the re-imports above are
+                // one cycle, not two.
+                await triggeredHook('ocr-requeue', { plugin: 'ocr' })
+            } catch (err) {
+                logger.warn('ocr: could not start the cycle that asks again: %s', err?.message ?? err)
+            }
+        }
+
+        // After every cycle's process phase, whichever started it — including
+        // the ones where this call had nothing in the journal.
+        if (requeue) onProcessed(() => arm())
+
+        // Where a recovered document's file lives, when it came from a
+        // folder source — the only kind that can be asked to import one
+        // file again. Anything else (a sheet row, a drive document) is
+        // updated in place instead.
+        function reimportTarget(entity) {
+            const folder = runtime.options?.sourceFolders?.[entity?.collection]
+            if (!folder || typeof entity.uri !== 'string' || !path.isAbsolute(entity.uri)) return null
+            const relativePath = path.relative(folder, entity.uri)
+            if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) return null
+            return { collection: entity.collection, relativePath }
+        }
+
+        // Matched documents in the catalog that nobody asked about — see
+        // lib/sweep.js. Null when the cycle was cancelled mid-walk.
+        async function sweep(pending, rows, { schemasSurface, signal }) {
+            const found = []
+            const seen = new Set()
+            for (const range of idRanges(Object.keys(options.match))) {
+                for await (const entity of iterateEntities(range ?? undefined)) {
+                    if (signal.aborted) return null
+                    if (!entity?.id || seen.has(entity.id) || pending.has(entity.id)) continue
+                    seen.add(entity.id)
+                    const hit = pickMatch(entity, options.match)
+                    const key = hit && keyOf.get(hit.pattern)
+                    if (!key) continue
+                    const previous = rows.get(entity.id)
+                    if (isDue(previous)) continue
+                    const source = await sourceFingerprint(entity)
+                    let step = previous?.step ?? ''
+                    // A re-import that never landed is queued as it is: its
+                    // answer is in the ledger, so the check below would call
+                    // it answered and leave the page without it.
+                    if (previous?.kind !== REIMPORT) {
+                        if (previous?.kind === DECLINED && (previous.source ?? null) === (source ?? null)) continue
+                        step = await unansweredStep(entity, hit, { schemasSurface, options })
+                        if (!step) continue
+                    }
+                    found.push({ id: entity.id, entity, hit, key, step, source, previous })
+                }
+            }
+            return found
         }
 
         onProcess(async (signal) => {
@@ -171,15 +325,91 @@ export function ocr(options = {}) {
                 if (signal.aborted) return
                 addPending(pending, entity, options.match)
             }
+
+            // The documents owed an answer from before: a call that threw,
+            // and — on the first pass — anything matched that has no answer
+            // at all. They are NOT journal entries, so they are asked off the
+            // catalog's copy, and only an answer puts them back into the
+            // pipeline (see `recovered` and `reimports` below). A retry the
+            // provider refuses again touches nothing else in the build.
+            let rows = requeue ? await readRequeue(keys) : new Map()
+            const sweptIds = new Set()
+            if (requeue && !swept) {
+                const found = await sweep(pending, rows, { schemasSurface, signal })
+                if (found === null || signal.aborted) return
+                swept = true
+                for (const { id } of found) sweptIds.add(id)
+                if (found.length) {
+                    logger.info('ocr: %d matched document(s) have no answer yet (%s) — asking now',
+                        found.length, [...new Set(found.map(f => f.step))].join(', '))
+                    // Queued durably, so a cycle cancelled before reaching
+                    // them does not lose them. With nowhere to queue them,
+                    // asked in this pass instead.
+                    if (await queueNow(found, keys) < found.length) {
+                        for (const { id, entity, hit } of found) {
+                            pending.set(id, { id, entity, hit, requeued: true })
+                        }
+                    }
+                    rows = await readRequeue(keys)
+                }
+            }
+            if (requeue) {
+                const now = Date.now()
+                let due = 0
+                for (const row of rows.values()) {
+                    if (!isDue(row, now) || pending.has(row.id)) continue
+                    if (signal.aborted) return
+                    const entity = await findEntity({ id: row.id })
+                    const hit = entity ? pickMatch(entity, options.match) : null
+                    if (!hit || !keyOf.has(hit.pattern)) {
+                        // The document is gone, or this call no longer
+                        // matches it with a question it can ask. Nothing is
+                        // owed.
+                        await clearRequeue(row.id, keys)
+                        continue
+                    }
+                    pending.set(row.id, { id: row.id, entity, hit, requeued: true })
+                    if (!sweptIds.has(row.id)) due++
+                }
+                if (due) logger.info('ocr: asking %d document(s) again that failed earlier', due)
+            }
             if (!pending.size) return
 
             // id → the meta to merge. Keyed by id because pass three
             // deserializes its own entity objects from the journal rows;
             // the ones gathered above are copies.
             const extracted = new Map()
+            // Requeued documents a retry answered and that cannot be sent
+            // back through a source: id → { entity, data }, re-entered into
+            // this cycle after pass three.
+            const recovered = new Map()
+            const reimporting = new Set()
+            // Stops asking once the provider has refused several calls in a
+            // row this pass — see lib/requeue.js. Only with the requeue on,
+            // because only then is a document left unasked asked later.
+            const breaker = requeue ? createBreaker() : null
+            const caching = options.cache !== false
 
-            await pMap(pending.values(), async ({ entity, hit }) => {
+            await pMap(pending.values(), async ({ entity, hit, requeued }) => {
                 if (signal.aborted) return
+
+                // This document's requeue row, when there is one to keep.
+                const key = keyOf.get(hit.pattern)
+                const previous = rows.get(entity.id)
+                const filing = requeue && key ? { id: entity.id, key, keys, previous } : null
+                let fingerprinted
+                const fingerprint = () => (fingerprinted ??= sourceFingerprint(entity))
+                // A row was written for this document this pass, or the pass
+                // was cut short — either way, nothing to clear.
+                let settled = false
+                // Every answer this pass is in the ledger, so a re-import will
+                // find it there rather than ask again.
+                let filed = true
+                // A config error leaves nothing to retry: a fix restarts the
+                // process, and the config change wipes the catalog anyway.
+                const abandon = async () => {
+                    if (requeued) await clearRequeue(entity.id, keys)
+                }
 
                 // A match is a SEQUENCE of questions — see lib/steps.js.
                 // Every form that worked before is a sequence of one, so the
@@ -189,6 +419,7 @@ export function ocr(options = {}) {
                     steps = normalizeSteps(hit.spec, { patternForError: hit.pattern })
                 } catch (err) {
                     logger.error('ocr: %s', err.message)
+                    await abandon()
                     return
                 }
 
@@ -212,6 +443,7 @@ export function ocr(options = {}) {
                         schema = resolveSchema(step.schemaSpec, { schemasSurface, patternForError: label })
                     } catch (err) {
                         logger.error('ocr: %s', err.message)
+                        await abandon()
                         return
                     }
 
@@ -242,7 +474,6 @@ export function ocr(options = {}) {
                         continue
                     }
 
-                    const caching = options.cache !== false
                     const identity = caching
                         ? questionFingerprint({
                             schema, model: options.model,
@@ -279,7 +510,7 @@ export function ocr(options = {}) {
                             produced = { ...(produced ?? {}), ...plan.reuse }
                             // Filed under the new schema so the next build is
                             // a direct hit rather than this search again.
-                            await writeLedger(entity, identity, source, plan.reuse, options.keep)
+                            filed = await writeLedger(entity, identity, source, plan.reuse, options.keep) && filed
                             logger.debug(
                                 'ocr: %s %s — the schema changed but the stored answer still satisfies it (no model call)',
                                 entity.id, label)
@@ -291,6 +522,21 @@ export function ocr(options = {}) {
                             reportSchemaChange(logger, label, pending.size, plan.fields)
                             logger.debug('ocr: %s %s — asking only for %j', entity.id, label, plan.fields)
                         }
+                    }
+
+                    // Past the ledger, which answers without the provider, and
+                    // before anything is read or cropped for a call that would
+                    // only be refused.
+                    if (breaker?.open) {
+                        breaker.skip()
+                        if (filing) {
+                            await recordRetry({ ...filing, step: label, source: await fingerprint(),
+                                reason: breaker.reason }, requeue)
+                        }
+                        logger.debug('ocr: %s %s not asked — the provider refused the calls before it',
+                            entity.id, label)
+                        settled = true
+                        break
                     }
 
                     // `source: false` asks about what earlier steps put on
@@ -355,7 +601,7 @@ export function ocr(options = {}) {
                                 threw ? 'provider error' : 'model reported failure', reason)
                         },
                         call: async () => {
-                            const { object } = await generateObject({
+                            const { object } = await generate({
                                 model:       options.model,
                                 schema:      buildEnvelope(asking),
                                 messages,
@@ -367,6 +613,7 @@ export function ocr(options = {}) {
                     })
 
                     if (result.ok) {
+                        breaker?.answered()
                         // A backfill's answer is only the missing fields, so
                         // it is merged onto the generation it was built from —
                         // and the merge is validated against the FULL schema
@@ -390,46 +637,122 @@ export function ocr(options = {}) {
                         }
                         meta = { ...meta, ...answer }
                         produced = { ...(produced ?? {}), ...answer }
-                        if (caching) await writeLedger(entity, identity, source, answer, options.keep)
+                        filed = caching
+                            && await writeLedger(entity, identity, source, answer, options.keep)
+                            && filed
                         logger.info('ocr: extracted %s (%s)%s', entity.id, label,
                             result.attempts > 1 ? ` after ${result.attempts} attempts` : '')
                     } else if (result.aborted) {
                         // Not a failure of the document or the model: the
                         // cycle was restarted under it. The engine carries
                         // the journal entry into the next cycle, so this is
-                        // picked up rather than lost.
+                        // picked up rather than lost — and a requeued
+                        // document's row is still due.
                         logger.debug('ocr: %s %s cancelled mid-flight — the next cycle will pick it up',
                             entity.id, label)
+                        settled = true
                         break
                     } else if (result.threw) {
-                        logger.error('ocr: %s %s — generateObject failed after %d attempt(s): %s',
-                            entity.id, label, result.attempts, result.reason)
+                        breaker?.failed(result.reason)
+                        const plan = filing
+                            ? await recordRetry({ ...filing, step: label, source: await fingerprint(),
+                                reason: result.reason }, requeue)
+                            : null
+                        logger.error('ocr: %s %s — generateObject failed after %d attempt(s): %s%s',
+                            entity.id, label, result.attempts, result.reason,
+                            plan ? ` — asking again in ${describeDelay(plan.delay)}` : '')
+                        settled = true
                         // Later steps read what this one was going to leave,
                         // so carrying on would ask a question about an answer
                         // that does not exist.
                         break
                     } else {
+                        // The provider answered, whatever the model said.
+                        breaker?.answered()
+                        if (filing) {
+                            await recordDeclined({ ...filing, step: label, source: await fingerprint(),
+                                reason: result.reason })
+                        }
                         logger.warn('ocr: %s %s — model could not extract after %d attempt(s): %s',
                             entity.id, label, result.attempts, result.reason)
+                        settled = true
                         break
                     }
                 }
 
+                if (requeued) {
+                    // Asked off the catalog's copy, so it is not in this
+                    // cycle's journal and pass three would never reach it.
+                    // Only a complete answer puts it back in the pipeline;
+                    // anything that failed is in its row, and the answers
+                    // that did arrive are in the ledger for the next try.
+                    if (settled) return
+                    if (!produced) {
+                        // Nothing was owed after all — the copy already
+                        // satisfies every step, or a step is not ready.
+                        await clearRequeue(entity.id, keys)
+                        return
+                    }
+                    // Back through its source, as if the file had been
+                    // edited, so everything after this plugin is derived from
+                    // the answer: on the reported site a later plugin lowers
+                    // a finding on what the photographs show, and a second
+                    // ocr() writes its summary from those findings. Applied
+                    // to the copy, the summary would describe findings the
+                    // page no longer has. The re-import finds the answer in
+                    // the ledger — which is why it is only taken when every
+                    // answer is filed there.
+                    const target = caching && filed ? reimportTarget(entity) : null
+                    if (target && await recordReimport({ ...filing, step: previous?.step,
+                        source: await fingerprint() }, requeue)) {
+                        reimports.set(entity.id, target)
+                        reimporting.add(entity.id)
+                        return
+                    }
+                    recovered.set(entity.id, { entity, data: produced })
+                    await clearRequeue(entity.id, keys)
+                    return
+                }
+                if (filing && previous && !settled) await clearRequeue(entity.id, keys)
                 if (produced) extracted.set(entity.id, produced)
             }, { concurrency, signal })
 
-            if (!extracted.size) return
+            if (breaker?.skipped) {
+                logger.warn('ocr: %d document(s) were not asked this pass — the provider refused the calls '
+                    + 'before them (%s). They are queued and asked again with the ones that failed.',
+                    breaker.skipped, breaker.reason ?? 'refused')
+            }
 
             // Pass three: apply. The mutation happens inside the body, which
             // is the only place useJournal's write-back can see it.
-            for await (const { entity } of useJournal(
-                'OCR apply',
-                [OPERATION.CREATE, OPERATION.UPDATE],
-                signal,
-            )) {
-                const data = extracted.get(entity.id)
-                if (!data) continue
-                entity.meta = { ...(entity.meta ?? {}), ...data }
+            if (extracted.size) {
+                for await (const { entity } of useJournal(
+                    'OCR apply',
+                    [OPERATION.CREATE, OPERATION.UPDATE],
+                    signal,
+                )) {
+                    const data = extracted.get(entity.id)
+                    if (!data) continue
+                    entity.meta = { ...(entity.meta ?? {}), ...data }
+                }
+            }
+
+            if (reimporting.size) {
+                logger.info('ocr: %d document(s) answered on a later attempt — re-importing them '
+                    + 'when this cycle ends, so what follows them is derived again', reimporting.size)
+            }
+
+            // Answered on a later attempt and with no source to re-import
+            // them: entered into THIS cycle's journal as the catalog has them
+            // plus the answer, so the rest of the cycle — persist, render —
+            // carries it. Plugins after this one see it; the ones before it
+            // already ran on the copy in an earlier cycle.
+            for (const { entity, data } of recovered.values()) {
+                if (signal.aborted) return
+                await updateEntity({ ...entity, meta: { ...(entity.meta ?? {}), ...data } })
+            }
+            if (recovered.size) {
+                logger.info('ocr: %d document(s) answered on a later attempt — updated in place', recovered.size)
             }
         })
         // Names this package to the runtime's loaded-plugin record, so

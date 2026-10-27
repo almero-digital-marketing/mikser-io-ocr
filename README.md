@@ -392,6 +392,53 @@ untouched. Two failure kinds, treated differently:
   unreadable scan gives it every time at full price — so it is retried once
   at most, however high `retries` goes.
 
+## When the provider is down: asking again later
+
+`retries` covers a hiccup inside one call. It does nothing for an outage: a
+spend cap, an exhausted credit balance, a provider that is down for an hour.
+A call that still throws after its retries is **written down** — in the same
+durable store as the ledger — and asked again later, on its own:
+
+```
+ocr: /skincheck/Janus/0888123456_271026.json /skincheck/Janus/**/*.json#visual — generateObject failed after 3 attempt(s): You have reached your specified API usage limits — asking again in 1m
+```
+
+Before this, nothing recorded that the document was owed an answer, and the
+journal only carries an entity again when its file changes. Reported: a spend
+cap refused 176 of 260 reports in the middle of a rebuild; the cap was lifted
+and mikser restarted, and the restart asked about the 2 new scans. The 176
+stayed blank.
+
+- **The delay grows.** A minute after the first failure, doubling after each
+  one, never more than an hour apart (`requeue: { first, max }`). A cap that
+  resets on the 1st of the month costs a couple of dozen attempts a day, not
+  one per cycle.
+- **A pass stops asking once the provider is refusing.** Three failures in a
+  row with no answer between them, and the rest of that pass is not asked —
+  they are filed under the same retry. The documents that failed together come
+  back together, so a retry during an outage is a handful of refused calls,
+  not one per document.
+- **A refused retry touches nothing.** It is asked off the catalog's copy,
+  outside the journal; only an answer puts the document back into the build.
+- **An answer goes back through the source.** A document from a folder source
+  is re-imported as if its file had been edited, so every plugin after `ocr()`
+  derives from the answer — a later step that reads it, a second `ocr()` that
+  writes from what the first found. The re-import finds the answer in the
+  ledger and pays nothing. A document no source can re-import (a sheet row, a
+  drive file) is updated in place instead.
+- **A restart asks right away.** The first pass after startup walks the
+  catalog for documents this `ocr()` matches that neither satisfy the schema
+  nor have an answer in the ledger, and asks them — including ones that failed
+  before this existed, which left no record. A step whose prompt says it is
+  not ready is left alone.
+- **The model's "cannot extract" is unchanged.** It is an answer, not a fault:
+  not asked again on a timer, and not at startup either, until the file
+  changes — otherwise every deploy would pay for the same refusal.
+
+Retries run only in a process that stays up (`--watch` or `--server`). In a
+one-shot build, the next build's startup pass is the retry. `requeue: false`
+turns all of it off — nothing recorded, nothing asked again, no startup walk.
+
 ## When the model can't read the source
 
 A strict schema is a trap: `generateObject` *forces* the model to return a value for every required field, so when the source is illegible, blank, the wrong kind of document, or corrupted, the model fabricates values to satisfy the schema — and the garbage lands on `entity.meta` looking like a real extraction. Nothing signals that anything went wrong.
@@ -447,6 +494,12 @@ ocr({
     // provider/JSON error gets all of them; an envelope saying the model
     // cannot read the document gets one at most, however high this goes.
     retries: 2,
+
+    // When a call still throws after `retries`: ask again later, `first` ms
+    // after the first failure, doubling, never more than `max` apart. A
+    // restart asks right away. false records nothing and asks nothing again.
+    // See "When the provider is down" above.
+    requeue: { first: 60_000, max: 3_600_000 },
 
     // REQUIRED. AI SDK model factory result.
     //   openai('gpt-4o-mini')        — OpenAI
@@ -578,6 +631,15 @@ Provider rate-limited. Options:
 - Drop to a smaller model (`gpt-4o` → `gpt-4o-mini`, `claude-3-5-sonnet` → `claude-3-5-haiku`) to reduce per-call cost and increase TPM headroom.
 - Add `temperature: 0` and a tight prompt to reduce retry rate.
 - Add an explicit pause between cycles via mikser's watch interval — only relevant during cold-start when many entities all need extraction at once.
+
+### `generateObject failed ... You have reached your specified API usage limits — asking again in 1m`
+
+A spend cap or an empty credit balance. Nothing is lost: each refused document
+is recorded and asked again on a growing delay, up to an hour apart (see
+[When the provider is down](#when-the-provider-is-down-asking-again-later)).
+Once the cap is lifted the readings come back within the hour on their own —
+or right away on a restart, whose first pass asks every matched document that
+has no answer. The records are in `mikser_ocr_requeue` in `mikser.data.sqlite`.
 
 ### `ocr: <id> — model could not extract (pattern ...): <reason>`
 
